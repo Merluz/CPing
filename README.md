@@ -2,9 +2,12 @@
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-green.svg)
 ![Latest Release](https://img.shields.io/github/v/release/Merluz/cping)
+[![CodeFactor](https://www.codefactor.io/repository/github/Merluz/cping/badge)](https://www.codefactor.io/repository/github/Merluz/cping)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
 ![Downloads](https://img.shields.io/github/downloads/Merluz/cping/total)
+![Build Status](https://github.com/Merluz/CPing/actions/workflows/build.yml/badge.svg)
+
 
 
 
@@ -139,6 +142,11 @@ cping 10.0.0.1 --if "Ethernet" -t 500
 ```bash
 cping 8.8.8.8 -c 5 --summary --json results.json
 ```
+## CLI Usage
+
+Here is a real output from CPing on Windows:
+
+![cping-example](assets/cli-example.png)
 
 ## Library Integration
 
