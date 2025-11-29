@@ -1,10 +1,10 @@
 # cping
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-green.svg)
-![Latest Release](https://img.shields.io/github/v/release/merluzz/cping)
+![Latest Release](https://img.shields.io/github/v/release/Merluz/cping)
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
-![Downloads](https://img.shields.io/github/downloads/merluzz/cping/total)
+![Downloads](https://img.shields.io/github/downloads/Merluz/cping/total)
 
 
 
