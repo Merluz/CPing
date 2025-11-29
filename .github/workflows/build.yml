@@ -1,0 +1,42 @@
+name: Build CPing (Linux)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build on Ubuntu
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev cmake g++
+
+      - name: Configure CMake (Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build CPing
+        run: cmake --build build --config Release -- -j$(nproc)
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          cd build
+          zip -r ../dist/cping-linux.zip bin lib
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cping-linux
+          path: dist/cping-linux.zip
