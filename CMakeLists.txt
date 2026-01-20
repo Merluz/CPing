@@ -1,9 +1,18 @@
 cmake_minimum_required(VERSION 3.21)
 project(CPing VERSION 1.0.0 LANGUAGES CXX)
 
+if (WIN32 AND NOT MSVC)
+    message(FATAL_ERROR "CPing on Windows must be built with MSVC")
+endif()
+
+
 # =====================================================================
 # Global configuration
 # =====================================================================
+if (MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

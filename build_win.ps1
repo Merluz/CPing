@@ -3,14 +3,21 @@ param(
     [string]$InstallDir = "dist/win64"
 )
 
-Write-Host "== CPING: Windows Release Build ==" -ForegroundColor Cyan
+Write-Host "== CPING: Windows Release Build (MSVC) ==" -ForegroundColor Cyan
 
 # Ensure clean
 if (Test-Path "build") { Remove-Item -Recurse -Force build }
 if (Test-Path $InstallDir) { Remove-Item -Recurse -Force $InstallDir }
 
-# Configure
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$InstallDir"
+# IMPORTANT:
+# This script MUST be run from:
+# "Developer PowerShell for Visual Studio"
+
+# Configure (force MSVC generator)
+cmake -S . -B build `
+    -G "Visual Studio 17 2022" `
+    -A x64 `
+    -DCMAKE_INSTALL_PREFIX="$InstallDir"
 
 # Build
 cmake --build build --config Release
