@@ -28,12 +28,18 @@ jobs:
       - name: Build CPing
         run: cmake --build build --config Release -- -j$(nproc)
 
+      - name: Run regression tests
+        run: ctest --test-dir build --output-on-failure
+
       - name: Package artifacts
         run: |
           mkdir -p dist
           cd build
           zip -r ../dist/cping-linux.zip bin lib
         shell: bash
+
+      - name: Run isolated Linux engine smoke test
+        run: sudo bash tests/linux_ping_smoke.sh "$PWD/build/tests/cping_linux_tests"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

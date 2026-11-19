@@ -151,6 +151,15 @@ target_link_libraries(cping PRIVATE cping_static)
 # =====================================================================
 enable_testing()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(cping_linux_tests tests/linux_ping_tests.cpp)
+    target_include_directories(cping_linux_tests PRIVATE src)
+    target_link_libraries(cping_linux_tests PRIVATE cping_static)
+    target_link_options(cping_linux_tests PRIVATE LINKER:--wrap=recvmsg)
+    set_target_properties(cping_linux_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+    add_test(NAME cping_linux_ttl_metadata COMMAND cping_linux_tests metadata)
+endif()
+
 add_executable(cping_tests tests/ping_tests.cpp)
 target_link_libraries(cping_tests PRIVATE cping_static)
 
