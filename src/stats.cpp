@@ -1,141 +1,75 @@
 #include "stats.hpp"
-#include <iostream>
-#include <vector>
-#include <limits>
-#include <cmath>
+
 #include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstddef>
+#include <iostream>
+#include <numeric>
 
-using namespace cping;
+PingSummary summarize_ping(std::uint64_t attempts, const std::vector<long>& rtts) {
+    PingSummary summary;
+    summary.attempts = attempts;
+    summary.replies = rtts.size();
+    assert(summary.replies <= summary.attempts);
 
-/**
- * Print a full summary block for classic (non-continuous) ping mode.
- *
- * Computes:
- *  - packet loss
- *  - min / avg / max RTT
- *  - median RTT
- *  - standard deviation (mdev)
- *  - jitter (temporal variation)
- *
- * The `probes` vector preserves probe order exactly as sent.
- */
-void print_summary(const std::string& ip, int sent,
-                   const std::vector<PingProbeResult>& probes)
-{
-    int received = 0;
-    long min_rtt = std::numeric_limits<long>::max();
-    long max_rtt = std::numeric_limits<long>::min();
-    long sum_rtt = 0;
-
-    // Store RTTs in temporal order
-    std::vector<long> rtts;
-    rtts.reserve(probes.size());
-
-    for (const auto& p : probes) {
-        if (p.success) {
-            received++;
-            min_rtt = std::min(min_rtt, p.rtt_ms);
-            max_rtt = std::max(max_rtt, p.rtt_ms);
-            sum_rtt += p.rtt_ms;
-            rtts.push_back(p.rtt_ms);
-        }
+    if (attempts != 0) {
+        const auto without_reply = summary.attempts - summary.replies;
+        const auto percent = 100.0L * without_reply / summary.attempts;
+        summary.without_reply_percent = static_cast<unsigned int>(std::lround(percent));
     }
 
-    int loss = sent > 0 ? (100 - (received * 100 / sent)) : 100;
+    if (rtts.empty()) {
+        return summary;
+    }
 
-    std::cout << "--- " << ip << " ping statistics ---\n";
-    std::cout << sent << " packets transmitted, "
-              << received << " received, "
-              << loss << "% packet loss\n";
+    auto& rtt = summary.rtt.emplace();
+    const auto samples = static_cast<double>(rtts.size());
+    rtt.avg = std::accumulate(rtts.begin(), rtts.end(), 0.0) / samples;
 
-    if (received == 0) return;
+    double squared_diffs = 0.0;
+    for (const auto sample : rtts) {
+        const auto difference = static_cast<double>(sample) - rtt.avg;
+        squared_diffs += difference * difference;
+    }
+    rtt.stddev = std::sqrt(squared_diffs / samples);
 
-    const double avg = static_cast<double>(sum_rtt) / received;
-
-    // --- Jitter (temporal variation; no sorting)
-    double jitter = 0.0;
+    // Jitter depends on arrival order, so only the copy for the median is sorted.
     if (rtts.size() > 1) {
-        long sum_diff = 0;
-        for (size_t i = 1; i < rtts.size(); ++i)
-            sum_diff += std::abs(rtts[i] - rtts[i - 1]);
-        jitter = static_cast<double>(sum_diff) / (rtts.size() - 1);
+        double total_change = 0.0;
+        for (std::size_t i = 1; i < rtts.size(); ++i) {
+            total_change += std::abs(static_cast<double>(rtts[i]) - rtts[i - 1]);
+        }
+        rtt.jitter = total_change / (samples - 1);
     }
 
-    // --- Median (requires sorted copy)
     auto sorted = rtts;
     std::sort(sorted.begin(), sorted.end());
-    double median = (sorted.size() % 2 == 0)
-        ? (sorted[sorted.size()/2 - 1] + sorted[sorted.size()/2]) / 2.0
-        : sorted[sorted.size()/2];
+    rtt.min = sorted.front();
+    rtt.max = sorted.back();
+    const auto mid = sorted.size() / 2;
+    rtt.median = static_cast<double>(sorted[mid]);
+    if (sorted.size() % 2 == 0) {
+        rtt.median = (rtt.median + static_cast<double>(sorted[mid - 1])) / 2.0;
+    }
 
-    // --- Standard deviation (mdev)
-    double var = 0.0;
-    for (auto r : rtts) var += (r - avg) * (r - avg);
-    var /= rtts.size();
-    const double stddev = std::sqrt(var);
-
-    std::cout << "rtt min/avg/max/median/mdev/jitter = "
-              << min_rtt << "/"
-              << avg << "/"
-              << max_rtt << "/"
-              << median << "/"
-              << stddev << "/"
-              << jitter << " ms\n";
+    return summary;
 }
 
-/**
- * Variant used when running with the --continuous flag.
- *
- * The caller maintains:
- *  - sent / received counters
- *  - rolling min/max/sum RTT
- *  - full RTT vector (temporal order)
- *
- * This function performs the same statistical calculations as print_summary(),
- * but avoids re-scanning probe structures.
- */
-void print_summary_continuous(const std::string& ip, int sent, int received,
-                              long min_rtt, long max_rtt, long sum_rtt,
-                              const std::vector<long>& rtts)
-{
-    int loss = sent > 0 ? (100 - (received * 100 / sent)) : 100;
-
-    std::cout << "\n--- " << ip << " ping statistics ---\n";
-    std::cout << sent << " packets transmitted, "
-              << received << " received, "
-              << loss << "% packet loss\n";
-
-    if (received == 0) return;
-
-    const double avg = static_cast<double>(sum_rtt) / received;
-
-    // --- Jitter (temporal order)
-    double jitter = 0.0;
-    if (rtts.size() > 1) {
-        long sum_diff = 0;
-        for (size_t i = 1; i < rtts.size(); ++i)
-            sum_diff += std::abs(rtts[i] - rtts[i - 1]);
-        jitter = static_cast<double>(sum_diff) / (rtts.size() - 1);
+void print_summary(const std::string& ip, const PingSummary& summary) {
+    std::cout << "--- " << ip << " ping statistics ---\n"
+              << summary.attempts << " attempts, "
+              << summary.replies << " replies, ";
+    if (summary.attempts == 0) {
+        std::cout << "loss unavailable\n";
+    } else {
+        std::cout << summary.without_reply_percent << "% without reply\n";
     }
 
-    // --- Median
-    auto sorted = rtts;
-    std::sort(sorted.begin(), sorted.end());
-    double median = (sorted.size() % 2 == 0)
-        ? (sorted[sorted.size()/2 - 1] + sorted[sorted.size()/2]) / 2.0
-        : sorted[sorted.size()/2];
-
-    // --- Standard deviation
-    double var = 0.0;
-    for (auto r : rtts) var += (r - avg) * (r - avg);
-    var /= rtts.size();
-    const double stddev = std::sqrt(var);
-
-    std::cout << "rtt min/avg/max/median/mdev/jitter = "
-              << min_rtt << "/"
-              << avg << "/"
-              << max_rtt << "/"
-              << median << "/"
-              << stddev << "/"
-              << jitter << " ms\n";
+    if (summary.rtt) {
+        const auto& rtt = *summary.rtt;
+        std::cout << "rtt min/avg/max/median/mdev/jitter = "
+                  << rtt.min << "/" << rtt.avg << "/" << rtt.max << "/"
+                  << rtt.median << "/" << rtt.stddev << "/" << rtt.jitter << " ms\n";
+    }
 }

@@ -136,7 +136,7 @@ endif()
 # =====================================================================
 # CLI executable
 # =====================================================================
-add_executable(cping
+set(CPING_CLI_SOURCES
     src/main.cpp
     src/cli.cpp
     src/runner.cpp
@@ -144,6 +144,7 @@ add_executable(cping
     src/export.cpp
 )
 
+add_executable(cping ${CPING_CLI_SOURCES})
 target_link_libraries(cping PRIVATE cping_static)
 
 # =====================================================================
@@ -153,6 +154,28 @@ enable_testing()
 
 add_executable(cping_tests tests/ping_tests.cpp)
 target_link_libraries(cping_tests PRIVATE cping_static)
+
+add_executable(cping_cli_fixture ${CPING_CLI_SOURCES} tests/cli_probe_fixture.cpp)
+target_include_directories(cping_cli_fixture PRIVATE include)
+if(NOT WIN32)
+    target_link_libraries(cping_cli_fixture PRIVATE pthread)
+endif()
+set_target_properties(cping_cli_fixture PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests")
+foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES)
+    string(TOUPPER "${config}" config_upper)
+    set_target_properties(cping_cli_fixture PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY_${config_upper} "${CMAKE_CURRENT_BINARY_DIR}/tests/${config}")
+endforeach()
+
+foreach(case IN ITEMS default_probe mixed_json mixed_csv retry_budget count_precedence
+        continuous_summary continuous_no_reply continuous_interrupted temporal_jitter failed_export)
+    add_test(NAME cping_cli_${case}
+        COMMAND ${CMAKE_COMMAND}
+            "-DCLI=$<TARGET_FILE:cping_cli_fixture>"
+            "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/tests/$<CONFIG>/${case}"
+            "-DCASE=${case}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_regression.cmake")
+endforeach()
 
 # =====================================================================
 # Install rules

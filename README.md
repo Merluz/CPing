@@ -106,20 +106,24 @@ cping <ip> [options]
 | Flag | Argument | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `-t`, `--timeout` | `<ms>` | 1000 | Timeout in milliseconds per attempt. |
-| `-r`, `--retries` | `<num>` | 1 | Number of retries (normal mode). |
-| `-i`, `--interval` | `<ms>` | 1000 | Interval between pings (continuous mode). |
-| `-c`, `--count` | `<num>` | ∞ | Total number of packets to send. |
+| `-r`, `--retries` | `<num>` | 1 | Total attempts in normal mode when `--count` is omitted. |
+| `-i`, `--interval` | `<ms>` | 1000 | Pause between attempts in continuous mode. |
+| `-c`, `--count` | `<num>` | — | Total attempts in either mode. Takes precedence over `--retries`. |
 | `-s`, `--size` | `<bytes>` | 0 | Custom ICMP payload size (in addition to header). |
 | `--ttl` | `<num>` | System | Force Time-To-Live for sent packets. |
 | `--if` | `<name>` | — | Force specific network interface (substring match). |
-| `--continuous` | — | Off | Run continuously until CTRL+C. |
+| `--continuous` | — | Off | Run until CTRL+C or the attempt limit, then print a summary. |
 | `--quiet` | — | Off | Suppress detailed output, show final result/summary only. |
-| `--summary` | — | Off | Show final statistics (loss, min/avg/max RTT). |
+| `--summary` | — | Off | Print only the final summary. |
 | `--timestamp` | — | Off | Add timestamp to each output line. |
 | `--no-color` | — | Off | Disable ANSI color output. |
-| `--csv` | `<path>` | — | Export results to a CSV file. |
-| `--json` | `<path>` | — | Export results to a JSON file. |
+| `--csv` | `<path>` | — | Write the session summary as CSV. |
+| `--json` | `<path>` | — | Write the session summary as JSON. |
 | `--export-append`| — | Off | Append to export file instead of overwriting. |
+
+In either mode, CPing exits with `0` after at least one reply and `1` when no probe gets a reply. A failed export also exits with `1` and reports the error on stderr.
+
+Exports are written even with zero replies and can be requested on their own. The `sent` field counts probe attempts, including attempts that fail before sending a packet. The `loss` field is the percentage of attempts without a reply, rounded to the nearest integer. If no probes are attempted, exported `loss` is zero. Exported RTT fields are zero when `received` is zero.
 
 ### Examples
 
@@ -140,7 +144,7 @@ cping 10.0.0.1 --if "Ethernet" -t 500
 
 **Export statistics to JSON**:
 ```bash
-cping 8.8.8.8 -c 5 --summary --json results.json
+cping 8.8.8.8 -c 5 --json results.json
 ```
 ## CLI Usage
 
