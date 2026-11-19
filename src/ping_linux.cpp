@@ -59,6 +59,11 @@ PingProbeResult detail::ping_once_linux(const sockaddr_in& target, const PingOpt
     PingProbeResult probe{};
     probe.if_name = options.if_name;
 
+    if (!valid_outgoing_ping_ttl(options.ttl)) {
+        probe.error_msg = "Invalid outgoing TTL";
+        return probe;
+    }
+
     // ---------------------------------------------------------------------
     // ICMP datagram socket
     // ---------------------------------------------------------------------
@@ -93,11 +98,6 @@ PingProbeResult detail::ping_once_linux(const sockaddr_in& target, const PingOpt
     int one = 1;
     ::setsockopt(s, IPPROTO_IP, IP_RECVTTL, &one, sizeof(one));
 
-    // Custom TTL (if supplied)
-    if (options.ttl > 0) {
-        ::setsockopt(s, IPPROTO_IP, IP_TTL, &options.ttl, sizeof(options.ttl));
-    }
-
     // Timeout
     timeval tv{};
     tv.tv_sec  = options.timeout_ms / 1000;
@@ -131,8 +131,8 @@ PingProbeResult detail::ping_once_linux(const sockaddr_in& target, const PingOpt
     // ---------------------------------------------------------------------
     auto t_send = std::chrono::high_resolution_clock::now();
 
-    if (::send(s, packet.data(), packet.size(), 0) < 0) {
-        probe.error_msg = "send() failed";
+    if (send_ping_request(s, nullptr, packet.data(), packet.size(), options.ttl) < 0) {
+        probe.error_msg = "sendmsg() failed";
         ::close(s);
         return probe;
     }

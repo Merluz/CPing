@@ -48,6 +48,38 @@ CPING_LOCAL inline int observed_ping_ttl(msghdr message) noexcept {
     return -1;
 }
 
+CPING_LOCAL inline bool valid_outgoing_ping_ttl(int ttl) noexcept {
+    // Zero has historically selected the default for zero-initialized C options.
+    return ttl >= -1 && ttl <= 255;
+}
+
+CPING_LOCAL inline ssize_t send_ping_request(int socket, const sockaddr_in* target,
+                                             unsigned char* packet, std::size_t size,
+                                             int ttl) noexcept {
+    iovec data{packet, size};
+    msghdr message{};
+    message.msg_iov = &data;
+    message.msg_iovlen = 1;
+    if (target) {
+        message.msg_name = const_cast<sockaddr_in*>(target);
+        message.msg_namelen = sizeof(*target);
+    }
+
+    // Overrides are attached to the datagram, even on the persistent socket.
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(ttl))]{};
+    if (ttl > 0) {
+        message.msg_control = control;
+        message.msg_controllen = sizeof(control);
+        auto* header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = IPPROTO_IP;
+        header->cmsg_type = IP_TTL;
+        header->cmsg_len = CMSG_LEN(sizeof(ttl));
+        std::memcpy(CMSG_DATA(header), &ttl, sizeof(ttl));
+    }
+
+    return ::sendmsg(socket, &message, 0);
+}
+
 CPING_LOCAL PingProbeResult ping_once_linux(const sockaddr_in& target, const PingOptions& options);
 
 } // namespace cping::detail

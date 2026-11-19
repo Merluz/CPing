@@ -160,6 +160,11 @@ if(WIN32)
         set_tests_properties(cping_windows_engine_${case} PROPERTIES TIMEOUT 12)
     endforeach()
 
+    add_executable(cping_windows_probe_ttl_tests tests/windows_probe_ttl_tests.cpp)
+    target_include_directories(cping_windows_probe_ttl_tests PRIVATE src)
+    target_link_libraries(cping_windows_probe_ttl_tests PRIVATE cping_static)
+    add_test(NAME cping_windows_probe_ttl COMMAND cping_windows_probe_ttl_tests)
+
     option(CPING_ENABLE_NPCAP_SMOKE "Run the Windows engine smoke test with the Npcap driver" OFF)
     if(CPING_ENABLE_NPCAP_SMOKE)
         add_executable(cping_windows_engine_idle_smoke tests/windows_engine_idle_smoke.cpp)
