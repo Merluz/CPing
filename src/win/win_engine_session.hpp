@@ -35,13 +35,19 @@ public:
 using OpenTransport = std::function<std::unique_ptr<Transport>()>;
 using StartListener = std::function<std::thread(std::function<void()>)>;
 
+struct Interface {
+    std::uint32_t index = 0;
+    std::string name;
+};
+
 class Engine {
 public:
     ~Engine();
 
-    bool start(const OpenTransport& open, const StartListener& launch = {});
+    bool start(const OpenTransport& open, const StartListener& launch = {}, Interface selection = {});
     void stop();
     bool available() const;
+    bool interface_pinned() const;
     PingProbeResult probe(std::uint32_t destination, int timeout_ms, int payload_size, int ttl);
 
 private:

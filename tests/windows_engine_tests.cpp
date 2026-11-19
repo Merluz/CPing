@@ -127,11 +127,12 @@ PingProbeResult complete_probe(std::future<PingProbeResult>& result) {
     return result.get();
 }
 
-void expect_reply(Engine& engine, FakeCapture& capture) {
+void expect_reply(Engine& engine, FakeCapture& capture, std::string_view expected_interface = {}) {
     auto result = launch_probe(engine, capture);
     capture.reply_to_probe();
     auto reply = complete_probe(result);
     require(reply.success && reply.ttl == 73 && reply.rtt_ms >= 0, "restarted engine did not deliver a reply");
+    require(reply.if_name == expected_interface, "unexpected interface for reply");
 }
 
 void expect_failure(const PingProbeResult& result, std::string_view message) {
@@ -201,6 +202,23 @@ void test_capture_failure() {
     engine.stop();
 }
 
+void test_interface() {
+    FakeCapture first;
+    FakeCapture second;
+    Engine engine;
+
+    require(engine.start(open_fake(first), {}, {11, "first"}), "explicit start failed");
+    require(engine.interface_pinned(), "explicit start did not pin an interface");
+    require(engine.start(open_fake(second)), "default init rejected the existing session");
+    require(engine.start(open_fake(second), {}, {11, "alias"}), "existing interface rejected");
+    require(!engine.start(open_fake(second), {}, {22, "second"}), "conflicting interface replaced active session");
+    expect_reply(engine, first, "first");
+    engine.stop();
+    require(!engine.interface_pinned(), "shutdown retained interface selection");
+    require(engine.start(open_fake(second), {}, {22, "second"}), "new interface rejected after shutdown");
+    expect_reply(engine, second, "second");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -209,7 +227,8 @@ int main(int argc, char** argv) {
         if (test == "init") test_init();
         else if (test == "stop") test_stop();
         else if (test == "capture-failure") test_capture_failure();
-        else throw std::runtime_error("expected init, stop, or capture-failure");
+        else if (test == "interface") test_interface();
+        else throw std::runtime_error("expected init, stop, capture-failure, or interface");
     } catch (const std::exception& error) {
         std::cerr << test << ": " << error.what() << '\n';
         return 1;

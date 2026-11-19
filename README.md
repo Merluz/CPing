@@ -111,7 +111,7 @@ cping <ip> [options]
 | `-c`, `--count` | `<num>` | ∞ | Total number of packets to send. |
 | `-s`, `--size` | `<bytes>` | 0 | Custom ICMP payload size (in addition to header). |
 | `--ttl` | `<num>` | System | Force Time-To-Live for sent packets. |
-| `--if` | `<name>` | — | Force specific network interface (substring match). |
+| `--if` | `<name>` | — | Require a specific outgoing interface. |
 | `--continuous` | — | Off | Run continuously until CTRL+C. |
 | `--quiet` | — | Off | Suppress detailed output, show final result/summary only. |
 | `--summary` | — | Off | Show final statistics (loss, min/avg/max RTT). |
@@ -120,6 +120,8 @@ cping <ip> [options]
 | `--csv` | `<path>` | — | Export results to a CSV file. |
 | `--json` | `<path>` | — | Export results to a JSON file. |
 | `--export-append`| — | Off | Append to export file instead of overwriting. |
+
+On Linux, `--if` takes an exact interface name. On Windows, it accepts a capture device name, adapter GUID, friendly name, or an unambiguous substring. An explicit Windows selection uses a dedicated probe that binds outgoing traffic and captures on the chosen adapter. The Windows native local-ping path returns an error for explicit interface requests.
 
 ### Examples
 

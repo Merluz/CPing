@@ -16,6 +16,7 @@ namespace {
 
 using win_engine::CaptureResult;
 using win_engine::Clock;
+using win_engine::Interface;
 using win_engine::Reply;
 using win_engine::Transport;
 
@@ -25,6 +26,16 @@ PingProbeResult failed_probe(const char* reason) {
     return probe;
 }
 
+using DeviceList = std::unique_ptr<pcap_if_t, decltype(&pcap_freealldevs)>;
+
+DeviceList list_capture_devices(char errbuf[PCAP_ERRBUF_SIZE]) {
+    pcap_if_t* device_list = nullptr;
+    const int listed = pcap_findalldevs(&device_list, errbuf);
+    DeviceList devices(device_list, pcap_freealldevs);
+    if (listed == -1) devices.reset();
+    return devices;
+}
+
 class WindowsTransport final : public Transport {
 public:
     ~WindowsTransport() override {
@@ -32,29 +43,19 @@ public:
         if (stop_event_) CloseHandle(stop_event_);
     }
 
-    bool open(const std::string& if_name) {
+    bool open(const Interface& selection) {
         char errbuf[PCAP_ERRBUF_SIZE]{};
-        pcap_if_t* device_list = nullptr;
-        const int listed = pcap_findalldevs(&device_list, errbuf);
-        const std::unique_ptr<pcap_if_t, decltype(&pcap_freealldevs)>
-            devices(device_list, pcap_freealldevs);
-        if (listed == -1 || !devices) return false;
-
-        pcap_if_t* device = nullptr;
-        if (!if_name.empty()) {
-            for (auto* entry = devices.get(); entry; entry = entry->next) {
-                if (entry->name && std::string(entry->name).find(if_name) != std::string::npos) {
-                    device = entry;
-                    break;
-                }
-            }
-        }
-        if (!device) {
+        auto capture_name = selection.name;
+        if (capture_name.empty()) {
+            const auto devices = list_capture_devices(errbuf);
+            if (!devices) return false;
             in_addr route_target{};
             route_target.S_un.S_addr = inet_addr("8.8.8.8");
-            device = pick_device_for_target(devices.get(), route_target);
+            const auto* device = pick_device_for_target(devices.get(), route_target);
+            if (!device || !device->name) return false;
+            capture_name = device->name;
         }
-        if (!device || !open_capture(capture_, device->name, 1, errbuf) ||
+        if (!open_capture(capture_, capture_name.c_str(), 1, errbuf) ||
             !apply_icmp_filter(capture_, "")) {
             return false;
         }
@@ -73,6 +74,10 @@ public:
 
         socket_ = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
         if (socket_ == INVALID_SOCKET) return false;
+        if (selection.index != 0) {
+            std::string error;
+            if (!set_win_ipv4_egress_interface(socket_, selection.index, error)) return false;
+        }
 
         DWORD default_ttl = 0;
         int size = sizeof(default_ttl);
@@ -156,7 +161,8 @@ namespace win_engine {
 
 class Engine::Session {
 public:
-    explicit Session(std::unique_ptr<Transport> transport) : transport_(std::move(transport)) {}
+    Session(std::unique_ptr<Transport> transport, Interface selection)
+        : transport_(std::move(transport)), interface_(std::move(selection)) {}
 
     ~Session() {
         if (listener_.joinable()) stop();
@@ -182,6 +188,10 @@ public:
     bool available() const {
         std::lock_guard lock(mutex_);
         return running_;
+    }
+
+    std::uint32_t interface_index() const {
+        return interface_.index;
     }
 
     PingProbeResult probe(std::uint16_t sequence, std::uint32_t destination,
@@ -230,6 +240,7 @@ public:
 
         auto result = reply.get();
         if (result.success) {
+            result.if_name = interface_.name;
             result.rtt_ms = static_cast<long>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - sent_at).count());
         }
@@ -271,6 +282,7 @@ private:
     }
 
     std::unique_ptr<Transport> transport_;
+    const Interface interface_;
     std::thread listener_;
     mutable std::mutex mutex_;
     const std::uint16_t id_ = static_cast<std::uint16_t>(GetCurrentProcessId() & 0xFFFF);
@@ -282,10 +294,12 @@ Engine::~Engine() {
     stop();
 }
 
-bool Engine::start(const OpenTransport& open, const StartListener& launch) {
+bool Engine::start(const OpenTransport& open, const StartListener& launch, Interface selection) {
     std::lock_guard lock(lifecycle_mutex_);
     if (const auto previous = session_.load()) {
-        if (previous->available()) return true;
+        if (previous->available()) {
+            return selection.index == 0 || previous->interface_index() == selection.index;
+        }
         previous->stop();
         session_.store(nullptr);
     }
@@ -294,7 +308,7 @@ bool Engine::start(const OpenTransport& open, const StartListener& launch) {
         auto transport = open();
         if (!transport) return false;
 
-        auto session = std::make_shared<Session>(std::move(transport));
+        auto session = std::make_shared<Session>(std::move(transport), std::move(selection));
         if (!session->start(launch)) return false;
 
         session_.store(std::move(session));
@@ -317,6 +331,11 @@ bool Engine::available() const {
     return session && session->available();
 }
 
+bool Engine::interface_pinned() const {
+    const auto session = session_.load();
+    return session && session->available() && session->interface_index() != 0;
+}
+
 PingProbeResult Engine::probe(std::uint32_t destination, int timeout_ms, int payload_size, int ttl) {
     const auto session = session_.load();
     if (!session) return failed_probe("Engine socket not available");
@@ -328,11 +347,23 @@ PingProbeResult Engine::probe(std::uint32_t destination, int timeout_ms, int pay
 } // namespace win_engine
 
 bool init_engine(const std::string& if_name) {
-    return native_engine().start([&if_name]() -> std::unique_ptr<Transport> {
+    Interface selection;
+    if (!if_name.empty()) {
+        char errbuf[PCAP_ERRBUF_SIZE]{};
+        const auto devices = list_capture_devices(errbuf);
+        if (!devices) return false;
+
+        WinPingInterface selected;
+        std::string error;
+        if (!resolve_win_ping_interface(devices.get(), if_name, selected, error)) return false;
+        selection = {selected.index, selected.device->name};
+    }
+
+    return native_engine().start([&selection]() -> std::unique_ptr<Transport> {
         auto transport = std::make_unique<WindowsTransport>();
-        if (!transport->open(if_name)) return nullptr;
+        if (!transport->open(selection)) return nullptr;
         return transport;
-    });
+    }, {}, selection);
 }
 
 void shutdown_engine() {
@@ -346,6 +377,9 @@ PingProbeResult ping_once_engine(const std::string& ip, int timeout_ms, int payl
     if (InetPtonA(AF_INET, ip.c_str(), &destination) != 1) return failed_probe("Invalid IP");
 
     if (is_local_ipv4_addr(destination)) {
+        if (native_engine().interface_pinned()) {
+            return failed_probe("Explicit interface selection is unavailable for native Windows local probes");
+        }
         PingProbeResult probe{};
         probe.success = icmp_ping_local(destination, timeout_ms, probe.rtt_ms, probe.ttl, ttl);
         if (!probe.success) probe.error_msg = "Local ICMP failed";

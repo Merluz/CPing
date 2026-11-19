@@ -29,6 +29,7 @@ PingResult ping_host(const std::string&, const PingOptions&) { return {}; }
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 #include <algorithm>
 
@@ -57,12 +58,13 @@ static uint16_t icmp_checksum(const void* data, size_t len) {
 PingProbeResult detail::ping_once_linux(const sockaddr_in& target, const PingOptions& options)
 {
     PingProbeResult probe{};
-    probe.if_name = options.if_name;
 
     if (!valid_outgoing_ping_ttl(options.ttl)) {
         probe.error_msg = "Invalid outgoing TTL";
         return probe;
     }
+
+    std::string bound_if_name = options.if_name;
 
     // ---------------------------------------------------------------------
     // ICMP datagram socket
@@ -73,12 +75,12 @@ PingProbeResult detail::ping_once_linux(const sockaddr_in& target, const PingOpt
         return probe;
     }
 
-    // Optional: bind to interface
-    if (!options.if_name.empty()) {
-        ::setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
-                     options.if_name.c_str(),
-                     (socklen_t)options.if_name.size());
+    if (!bind_ping_interface(s, bound_if_name)) {
+        ::close(s);
+        probe.error_msg = "Could not bind ICMP socket to interface: " + bound_if_name;
+        return probe;
     }
+    probe.if_name = std::move(bound_if_name);
 
     const uint16_t id = bind_ping_socket_id(s);
     if (id == 0) {
@@ -221,7 +223,6 @@ PingResult ping_host(const std::string& ip, const PingOptions& opt) {
     target.sin_family = AF_INET;
     if (inet_pton(AF_INET, ip.c_str(), &target.sin_addr) != 1) {
         PingProbeResult probe{};
-        probe.if_name = opt.if_name;
         probe.error_msg = "Invalid IP address";
         result.probes.assign(static_cast<std::size_t>(attempts), probe);
         return result;

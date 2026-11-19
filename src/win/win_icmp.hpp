@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <cstdint>
+#include <string>
 
 bool valid_request_ttl(int ttl) noexcept;
 
@@ -18,7 +19,9 @@ bool send_icmp_echo_raw(const in_addr& dst,
                         uint16_t seq,
                         const void* payload,
                         size_t len,
-                        int ttl = -1);
+                        int ttl,
+                        ULONG interface_index,
+                        std::string& error);
 
 /**
  * Performs a local ping using the OS ICMP API (IcmpSendEcho).

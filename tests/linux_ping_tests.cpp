@@ -194,6 +194,79 @@ bool test_ttl_smoke(const std::string& peer, int peer_ttl) {
     return ok;
 }
 
+bool expect_interface(std::string_view scenario, const cping::PingProbeResult& result,
+                      std::string_view expected) {
+    if (result.if_name == expected) return true;
+    std::cerr << scenario << " expected interface " << expected << ", got " << result.if_name << '\n';
+    return false;
+}
+
+bool test_interface_smoke(const std::string& peer, int local_ttl, int peer_ttl,
+                          const std::string& alternate) {
+    cping::PingOptions options;
+    options.payload_size = 41;
+    bool ok = expect_one_shot("Default route", cping::ping_host(peer, options), peer_ttl);
+
+    options.if_name = alternate;
+    options.payload_size = 42;
+    const auto bound = cping::ping_host(peer, options);
+    ok &= expect_one_shot("Explicit alternate interface", bound, peer_ttl) &&
+          expect_interface("Explicit alternate interface", bound.probes.front(), alternate);
+
+    const std::string absent = "cping-missing";
+    const std::string prefix = alternate.substr(0, alternate.size() - 1);
+    for (const auto& [name, payload_size] : std::array<std::pair<std::string, int>, 2>{{
+             {prefix, 43}, {absent, 44}}}) {
+        options.if_name = name;
+        options.payload_size = payload_size;
+        const auto result = cping::ping_host(peer, options);
+        if (result.reachable || result.probes.size() != 1 || result.probes.front().success ||
+            !result.probes.front().error_msg.starts_with("Could not bind ICMP socket to interface:") ||
+            !result.probes.front().if_name.empty()) {
+            std::cerr << "Expected a bind error for interface " << name << '\n';
+            ok = false;
+        }
+    }
+
+    options.if_name = "lo";
+    options.payload_size = 45;
+    const auto incompatible = cping::ping_host(peer, options);
+    if (incompatible.reachable || incompatible.probes.size() != 1 || incompatible.probes.front().success ||
+        !expect_interface("Loopback-bound probe to peer", incompatible.probes.front(), "lo")) {
+        std::cerr << "Loopback must not reach the peer through either veth\n";
+        ok = false;
+    }
+
+    {
+        EngineShutdown shutdown;
+        if (cping::init_engine(absent) || cping::engine_available()) {
+            std::cerr << "Expected an unavailable engine after an invalid interface bind\n";
+            return false;
+        }
+        if (!cping::init_engine(alternate)) {
+            std::cerr << "Unable to initialize the engine on " << alternate << '\n';
+            return false;
+        }
+        if (!cping::init_engine() || !cping::init_engine(alternate) || cping::init_engine("lo")) {
+            std::cerr << "Expected the active engine to preserve its explicit interface\n";
+            ok = false;
+        }
+        const auto reply = cping::ping_once_engine(peer, options.timeout_ms, 46);
+        ok &= expect_reply("Engine on alternate interface", reply, peer_ttl);
+        ok &= expect_interface("Engine on alternate interface", reply, alternate);
+    }
+
+    EngineShutdown shutdown;
+    if (!cping::init_engine("lo")) {
+        std::cerr << "Unable to initialize the loopback-bound engine\n";
+        return false;
+    }
+    const auto loopback = cping::ping_once_engine("127.0.0.1", options.timeout_ms);
+    ok &= expect_reply("Loopback-bound engine", loopback, local_ttl);
+    ok &= expect_interface("Loopback-bound engine", loopback, "lo");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -206,7 +279,11 @@ int main(int argc, char* argv[]) {
     if (argc == 4 && std::string_view(argv[1]) == "ttl-smoke") {
         return test_ttl_smoke(argv[2], std::stoi(argv[3])) ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (argc == 6 && std::string_view(argv[1]) == "interface-smoke") {
+        return test_interface_smoke(argv[2], std::stoi(argv[3]), std::stoi(argv[4]), argv[5])
+            ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     std::cerr << "Usage: " << argv[0] << " metadata | smoke PEER_IP LOCAL_TTL PEER_TTL"
-              << " | ttl-smoke PEER_IP PEER_TTL\n";
+              << " | ttl-smoke PEER_IP PEER_TTL | interface-smoke PEER_IP LOCAL_TTL PEER_TTL INTERFACE\n";
     return EXIT_FAILURE;
 }

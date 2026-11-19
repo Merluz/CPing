@@ -21,6 +21,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -63,6 +64,7 @@ static std::unordered_map<
 > g_waiters;
 
 static std::mutex g_mtx;
+static std::string g_if_name; // Protected by g_mtx.
 static std::atomic<uint16_t> g_seq{1};
 
 
@@ -159,18 +161,21 @@ static void listener_loop() {
 // Engine lifecycle
 // ============================================================================
 bool init_engine(const std::string& if_name) {
-    if (g_running.load())
-        return true;
+    if (g_running.load()) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        return if_name.empty() || if_name == g_if_name;
+    }
+
+    std::string bound_if_name = if_name;
 
     // ICMP datagram socket (no IP header exposure)
     int s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
     if (s < 0)
         return false;
 
-    // Optional interface binding
-    if (!if_name.empty()) {
-        ::setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
-                     if_name.c_str(), (socklen_t)if_name.size());
+    if (!detail::bind_ping_interface(s, bound_if_name)) {
+        ::close(s);
+        return false;
     }
 
     const uint16_t id = detail::bind_ping_socket_id(s);
@@ -183,6 +188,10 @@ bool init_engine(const std::string& if_name) {
     int one = 1;
     ::setsockopt(s, IPPROTO_IP, IP_RECVTTL, &one, sizeof(one));
 
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_if_name = std::move(bound_if_name);
+    }
     g_sock = s;
     g_socket_id = id;
     g_running = true;
@@ -194,6 +203,8 @@ bool init_engine(const std::string& if_name) {
         ::close(g_sock);
         g_sock = -1;
         g_socket_id = 0;
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_if_name.clear();
         return false;
     }
 
@@ -225,6 +236,7 @@ void shutdown_engine() {
             try { kv.second.set_value(PingProbeResult{}); } catch (...) {}
         }
         g_waiters.clear();
+        g_if_name.clear();
     }
 }
 
@@ -252,12 +264,18 @@ PingProbeResult ping_once_engine(const std::string& ip,
         return probe;
     }
 
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        probe.if_name = g_if_name;
+    }
+
     // A local target can use a connected, temporary ping socket.
     if (is_local_ipv4_addr_linux(target.sin_addr)) {
         PingOptions options{};
         options.timeout_ms = timeout_ms;
         options.payload_size = payload_size;
         options.ttl = ttl;
+        options.if_name = std::move(probe.if_name);
         return detail::ping_once_linux(target, options);
     }
 
@@ -313,15 +331,16 @@ PingProbeResult ping_once_engine(const std::string& ip,
     if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) ==
         std::future_status::ready)
     {
-        probe = fut.get();
+        auto reply = fut.get();
+        reply.if_name = std::move(probe.if_name);
 
         auto t_recv = std::chrono::high_resolution_clock::now();
-        probe.rtt_ms =
+        reply.rtt_ms =
             (long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 t_recv - t_send)
                 .count();
 
-        return probe;
+        return reply;
     }
 
     // Timeout: cleanup
