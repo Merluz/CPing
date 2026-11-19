@@ -1,32 +1,29 @@
 #pragma once
+
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
-#include "cping/ping.hpp"
 
-/**
- * Print summary statistics for classic ping mode.
- *
- * Accepts the complete probe list and computes:
- *  - min / avg / max RTT
- *  - median RTT
- *  - standard deviation (mdev)
- *  - jitter (temporal)
- *  - packet loss
- */
-void print_summary(const std::string& ip,
-                   int sent,
-                   const std::vector<cping::PingProbeResult>& probes);
+#include "export.hpp"
 
-/**
- * Print summary statistics for continuous ping mode.
- *
- * The caller maintains rolling statistics and a vector of RTTs
- * in temporal order; this function performs the derived metrics.
- */
-void print_summary_continuous(const std::string& ip,
-                              int sent,
-                              int received,
-                              long min_rtt,
-                              long max_rtt,
-                              long sum_rtt,
-                              const std::vector<long>& rtts);
+struct RttSummary {
+    long min{0};
+    double avg{0.0};
+    long max{0};
+    double median{0.0};
+    double stddev{0.0};
+    double jitter{0.0};
+};
+
+struct PingSummary {
+    std::uint64_t attempts{0};
+    std::uint64_t replies{0};
+    unsigned int without_reply_percent{0};
+    std::optional<RttSummary> rtt;
+};
+
+PingSummary summarize_ping(std::uint64_t attempts, const std::vector<long>& rtts);
+void print_summary(const std::string& ip, const PingSummary& summary);
+bool export_summary(const std::string& path, ExportFormat format,
+                    const std::string& ip, const PingSummary& summary, bool append);
