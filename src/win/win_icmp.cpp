@@ -49,6 +49,23 @@ bool ensure_wsa() {
     return true;
 }
 
+bool valid_request_ttl(int ttl) noexcept {
+    // Zero also selects the default for zero-initialized C options.
+    return ttl >= -1 && ttl <= 255;
+}
+
+bool set_request_ttl(SOCKET socket, int ttl, int default_ttl) noexcept {
+    if (!valid_request_ttl(ttl))
+        return false;
+    if (ttl <= 0)
+        ttl = default_ttl;
+    if (ttl <= 0)
+        return true;
+
+    const DWORD value = static_cast<DWORD>(ttl);
+    return setsockopt(socket, IPPROTO_IP, IP_TTL,
+                      reinterpret_cast<const char*>(&value), sizeof(value)) == 0;
+}
 
 // ---------------------------------------------------------------------------
 // Raw ICMP Echo Request
@@ -61,9 +78,9 @@ bool ensure_wsa() {
  * @param seq     Sequence field (host byte order)
  * @param payload Optional payload pointer
  * @param len     Payload length in bytes
- * @param ttl     Custom TTL, -1 = leave system default
+ * @param ttl     Outgoing TTL, -1 or 0 for the system default
  *
- * @return true if sendto() succeeds.
+ * @return true if the request was sent with the requested options.
  */
 bool send_icmp_echo_raw(const in_addr& dst,
                         uint16_t id,
@@ -79,14 +96,9 @@ bool send_icmp_echo_raw(const in_addr& dst,
     if (s == INVALID_SOCKET)
         return false;
 
-    if (ttl > 0) {
-        setsockopt(
-            s,
-            IPPROTO_IP,
-            IP_TTL,
-            reinterpret_cast<const char*>(&ttl),
-            sizeof(ttl)
-        );
+    if (!set_request_ttl(s, ttl)) {
+        closesocket(s);
+        return false;
     }
 
     // Build ICMP header + payload
@@ -137,30 +149,40 @@ bool send_icmp_echo_raw(const in_addr& dst,
  * @param timeout_ms   Timeout for the request
  * @param out_rtt_ms   RTT result
  * @param out_ttl      TTL from response
+ * @param request_ttl  Outgoing TTL, -1 or 0 for the system default
  *
  * @return true if the ping succeeded.
  */
 bool icmp_ping_local(const in_addr& dst,
                      int timeout_ms,
                      long& out_rtt_ms,
-                     int& out_ttl)
+                     int& out_ttl,
+                     int request_ttl)
 {
+    if (!valid_request_ttl(request_ttl))
+        return false;
+
     HANDLE hIcmp = IcmpCreateFile();
     if (hIcmp == INVALID_HANDLE_VALUE)
         return false;
 
     char sendData[8] = {0};  // Minimal payload
-    DWORD replySize = sizeof(ICMP_ECHO_REPLY) + sizeof(sendData);
+    constexpr DWORD replySize = sizeof(ICMP_ECHO_REPLY) + sizeof(sendData) + 8;
     std::vector<char> replyBuf(replySize);
 
-    IP_OPTION_INFORMATION opt{}; // No IP options
+    IP_OPTION_INFORMATION opt{};
+    PIP_OPTION_INFORMATION requestOptions = nullptr;
+    if (request_ttl > 0) {
+        opt.Ttl = static_cast<UCHAR>(request_ttl);
+        requestOptions = &opt;
+    }
 
     DWORD dwRes = IcmpSendEcho(
         hIcmp,
         dst.S_un.S_addr,
         sendData,
         sizeof(sendData),
-        &opt,
+        requestOptions,
         replyBuf.data(),
         replySize,
         timeout_ms

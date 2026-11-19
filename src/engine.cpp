@@ -72,7 +72,16 @@ public:
         if (!stop_event_ || !ensure_wsa()) return false;
 
         socket_ = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-        return socket_ != INVALID_SOCKET;
+        if (socket_ == INVALID_SOCKET) return false;
+
+        DWORD default_ttl = 0;
+        int size = sizeof(default_ttl);
+        if (getsockopt(socket_, IPPROTO_IP, IP_TTL, reinterpret_cast<char*>(&default_ttl),
+                       &size) == SOCKET_ERROR || default_ttl < 1 || default_ttl > 255) {
+            return false;
+        }
+        default_ttl_ = static_cast<int>(default_ttl);
+        return true;
     }
 
     CaptureResult receive(Reply& reply) noexcept override {
@@ -114,9 +123,7 @@ public:
         target.sin_family = AF_INET;
         target.sin_addr.S_un.S_addr = destination;
 
-        if (ttl > 0) {
-            setsockopt(socket_, IPPROTO_IP, IP_TTL, reinterpret_cast<const char*>(&ttl), sizeof(ttl));
-        }
+        if (!set_request_ttl(socket_, ttl, default_ttl_)) return false;
 
         sent_at = Clock::now();
         return sendto(socket_, reinterpret_cast<const char*>(packet.data()),
@@ -131,6 +138,7 @@ public:
 private:
     Capture capture_;
     SOCKET socket_ = INVALID_SOCKET;
+    int default_ttl_ = -1;
     HANDLE capture_event_ = nullptr; // Owned by the pcap handle.
     HANDLE stop_event_ = nullptr;
 };
@@ -179,6 +187,7 @@ public:
     PingProbeResult probe(std::uint16_t sequence, std::uint32_t destination,
                           int timeout_ms, int payload_size, int ttl) {
         if (payload_size < 0) return failed_probe("Invalid payload size");
+        if (!valid_request_ttl(ttl)) return failed_probe("Invalid TTL");
 
         IcmpHeader request{};
         request.type = 8;
@@ -331,12 +340,14 @@ void shutdown_engine() {
 }
 
 PingProbeResult ping_once_engine(const std::string& ip, int timeout_ms, int payload_size, int ttl) {
+    if (!valid_request_ttl(ttl)) return failed_probe("Invalid TTL");
+
     in_addr destination{};
     if (InetPtonA(AF_INET, ip.c_str(), &destination) != 1) return failed_probe("Invalid IP");
 
     if (is_local_ipv4_addr(destination)) {
         PingProbeResult probe{};
-        probe.success = icmp_ping_local(destination, timeout_ms, probe.rtt_ms, probe.ttl);
+        probe.success = icmp_ping_local(destination, timeout_ms, probe.rtt_ms, probe.ttl, ttl);
         if (!probe.success) probe.error_msg = "Local ICMP failed";
         return probe;
     }

@@ -3,10 +3,15 @@
 #include <ws2tcpip.h>
 #include <cstdint>
 
+bool valid_request_ttl(int ttl) noexcept;
+
+// A default request restores a supplied baseline on reused sockets.
+bool set_request_ttl(SOCKET socket, int ttl, int default_ttl = -1) noexcept;
+
 /**
  * Sends a raw ICMP Echo Request (type=8).
  *
- * @return true if sendto() succeeds.
+ * @return true if the request was sent with the requested options.
  */
 bool send_icmp_echo_raw(const in_addr& dst,
                         uint16_t id,
@@ -22,7 +27,8 @@ bool send_icmp_echo_raw(const in_addr& dst,
 bool icmp_ping_local(const in_addr& dst,
                      int timeout_ms,
                      long& out_rtt_ms,
-                     int& out_ttl);
+                     int& out_ttl,
+                     int request_ttl = -1);
 
 /**
  * Ensures Winsock initialization (WSAStartup).

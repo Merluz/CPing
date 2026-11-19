@@ -47,7 +47,7 @@ static std::atomic<uint16_t> g_seq{1};
  * @param timeout_ms       Probe timeout in milliseconds
  * @param if_name_override Manual interface substring (optional)
  * @param payload_size     Extra payload bytes to append after the timestamp
- * @param ttl_opt          Custom TTL, -1 = system default
+ * @param ttl_opt          Outgoing TTL, -1 or 0 for the system default
  *
  * @return PingProbeResult containing RTT, TTL, error message, etc.
  */
@@ -74,6 +74,11 @@ static PingProbeResult ping_once_win(const std::string& ip,
         return probe;
     }
 
+    if (!valid_request_ttl(ttl_opt)) {
+        probe.error_msg = "Invalid outgoing TTL";
+        return probe;
+    }
+
     // -----------------------------------------------------------------------
     // Local-host fast path (pure local-loop ICMP)
     // -----------------------------------------------------------------------
@@ -81,7 +86,7 @@ static PingProbeResult ping_once_win(const std::string& ip,
         long rtt_ms = 0;
         int ttl = -1;
 
-        if (icmp_ping_local(dst_addr, timeout_ms, rtt_ms, ttl)) {
+        if (icmp_ping_local(dst_addr, timeout_ms, rtt_ms, ttl, ttl_opt)) {
             probe.success = true;
             probe.rtt_ms = rtt_ms;
             if(ttl != -1)

@@ -183,10 +183,6 @@ bool init_engine(const std::string& if_name) {
     int one = 1;
     ::setsockopt(s, IPPROTO_IP, IP_RECVTTL, &one, sizeof(one));
 
-    // Default TTL (can be overridden per-probe)
-    int ttl_def = 64;
-    ::setsockopt(s, IPPROTO_IP, IP_TTL, &ttl_def, sizeof(ttl_def));
-
     g_sock = s;
     g_socket_id = id;
     g_running = true;
@@ -251,6 +247,11 @@ PingProbeResult ping_once_engine(const std::string& ip,
         return probe;
     }
 
+    if (!detail::valid_outgoing_ping_ttl(ttl)) {
+        probe.error_msg = "Invalid outgoing TTL";
+        return probe;
+    }
+
     // A local target can use a connected, temporary ping socket.
     if (is_local_ipv4_addr_linux(target.sin_addr)) {
         PingOptions options{};
@@ -300,25 +301,11 @@ PingProbeResult ping_once_engine(const std::string& ip,
     hdr->checksum = 0;
     hdr->checksum = checksum16(packet.data(), packet.size());
 
-    // Optional TTL override
-    if (ttl > 0) {
-        ::setsockopt(g_sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
-    }
-
     auto t_send = std::chrono::high_resolution_clock::now();
-
-    ssize_t sent =
-        ::sendto(g_sock,
-                 packet.data(),
-                 packet.size(),
-                 0,
-                 reinterpret_cast<const sockaddr*>(&target),
-                 sizeof(target));
-
-    if (sent < 0) {
+    if (detail::send_ping_request(g_sock, &target, packet.data(), packet.size(), ttl) < 0) {
         std::lock_guard<std::mutex> lk(g_mtx);
         g_waiters.erase(k);
-        probe.error_msg = "sendto() failed";
+        probe.error_msg = "sendmsg() failed";
         return probe;
     }
 
