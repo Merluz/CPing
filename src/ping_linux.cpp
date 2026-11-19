@@ -16,15 +16,14 @@ PingResult ping_host(const std::string&, const PingOptions&) { return {}; }
  *
  * This file provides a standalone ICMP Echo workflow using:
  *   - DATAGRAM ICMP sockets (SOCK_DGRAM + IPPROTO_ICMP)
- *   - recvmsg() with IP_RECVTTL to extract hop count
+ *   - recvmsg() with IP_RECVTTL to read the observed IPv4 TTL
  *   - manual checksum + timestamp payload
  *
  * It mirrors the Windows version in structure and guarantees that
  * PingResult and PingProbeResult behave identically across platforms.
  */
 
-#include "cping/ping.hpp"
-#include "cping/ip.hpp"
+#include "linux_ping_socket.hpp"
 #include "cping/util.hpp"
 
 #include <chrono>
@@ -32,7 +31,6 @@ PingResult ping_host(const std::string&, const PingOptions&) { return {}; }
 #include <string>
 #include <vector>
 #include <algorithm>
-#include <limits>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -56,25 +54,10 @@ static uint16_t icmp_checksum(const void* data, size_t len) {
 // ============================================================================
 // Perform a single ICMP Echo attempt on Linux (blocking)
 // ============================================================================
-static PingProbeResult ping_once_linux(const std::string& ip,
-                                       int timeout_ms,
-                                       const std::string& if_name_override,
-                                       int payload_size,
-                                       int ttl_opt)
+PingProbeResult detail::ping_once_linux(const sockaddr_in& target, const PingOptions& options)
 {
     PingProbeResult probe{};
-    probe.if_name = if_name_override;
-
-    // ---------------------------------------------------------------------
-    // Parse target IPv4
-    // ---------------------------------------------------------------------
-    sockaddr_in dst{};
-    dst.sin_family = AF_INET;
-
-    if (inet_pton(AF_INET, ip.c_str(), &dst.sin_addr) != 1) {
-        probe.error_msg = "Invalid IP address";
-        return probe;
-    }
+    probe.if_name = options.if_name;
 
     // ---------------------------------------------------------------------
     // ICMP datagram socket
@@ -86,14 +69,21 @@ static PingProbeResult ping_once_linux(const std::string& ip,
     }
 
     // Optional: bind to interface
-    if (!if_name_override.empty()) {
+    if (!options.if_name.empty()) {
         ::setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE,
-                     if_name_override.c_str(),
-                     (socklen_t)if_name_override.size());
+                     options.if_name.c_str(),
+                     (socklen_t)options.if_name.size());
+    }
+
+    const uint16_t id = bind_ping_socket_id(s);
+    if (id == 0) {
+        probe.error_msg = "Could not assign an ICMP socket identifier";
+        ::close(s);
+        return probe;
     }
 
     // Must connect() for consistent recvmsg() semantics
-    if (::connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) < 0) {
+    if (::connect(s, reinterpret_cast<const sockaddr*>(&target), sizeof(target)) < 0) {
         probe.error_msg = "connect() failed";
         ::close(s);
         return probe;
@@ -104,27 +94,28 @@ static PingProbeResult ping_once_linux(const std::string& ip,
     ::setsockopt(s, IPPROTO_IP, IP_RECVTTL, &one, sizeof(one));
 
     // Custom TTL (if supplied)
-    if (ttl_opt > 0) {
-        ::setsockopt(s, IPPROTO_IP, IP_TTL, &ttl_opt, sizeof(ttl_opt));
+    if (options.ttl > 0) {
+        ::setsockopt(s, IPPROTO_IP, IP_TTL, &options.ttl, sizeof(options.ttl));
     }
 
     // Timeout
     timeval tv{};
-    tv.tv_sec  = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    tv.tv_sec  = options.timeout_ms / 1000;
+    tv.tv_usec = (options.timeout_ms % 1000) * 1000;
     ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     // ---------------------------------------------------------------------
     // Build ICMP Echo Request
     // ---------------------------------------------------------------------
-    const size_t packet_size = sizeof(icmphdr) + sizeof(uint64_t) + payload_size;
+    const size_t packet_size = sizeof(icmphdr) + sizeof(uint64_t) + options.payload_size;
     std::vector<unsigned char> packet(packet_size, 0);
 
     auto* hdr = reinterpret_cast<icmphdr*>(packet.data());
     hdr->type = ICMP_ECHO;
     hdr->code = 0;
-    hdr->un.echo.id = 0;
-    hdr->un.echo.sequence = 0;
+    constexpr uint16_t sequence = 0;
+    hdr->un.echo.id = htons(id);
+    hdr->un.echo.sequence = htons(sequence);
 
     // Timestamp payload
     uint64_t ticks = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -150,7 +141,7 @@ static PingProbeResult ping_once_linux(const std::string& ip,
     // Prepare recvmsg()
     // ---------------------------------------------------------------------
     uint8_t recv_buf[1500];
-    char cbuf[256];
+    alignas(cmsghdr) char cbuf[256];
 
     iovec iov{ recv_buf, sizeof(recv_buf) };
 
@@ -158,20 +149,19 @@ static PingProbeResult ping_once_linux(const std::string& ip,
     sockaddr_in src{};
 
     msg.msg_name    = &src;
-    msg.msg_namelen = sizeof(src);
     msg.msg_iov     = &iov;
     msg.msg_iovlen  = 1;
     msg.msg_control = cbuf;
-    msg.msg_controllen = sizeof(cbuf);
 
     auto deadline = std::chrono::steady_clock::now()
-                  + std::chrono::milliseconds(std::max(1, timeout_ms));
+                  + std::chrono::milliseconds(std::max(1, options.timeout_ms));
 
     // ---------------------------------------------------------------------
     // Receive loop
     // ---------------------------------------------------------------------
     while (std::chrono::steady_clock::now() < deadline) {
-
+        msg.msg_namelen = sizeof(src);
+        msg.msg_controllen = sizeof(cbuf);
         ssize_t n = ::recvmsg(s, &msg, 0);
 
         if (n < 0) {
@@ -186,8 +176,10 @@ static PingProbeResult ping_once_linux(const std::string& ip,
         if (n < (ssize_t)sizeof(icmphdr))
             continue;
 
-        const icmphdr* ricmp = reinterpret_cast<const icmphdr*>(recv_buf);
-        if (ricmp->type != ICMP_ECHOREPLY)
+        icmphdr reply{};
+        std::memcpy(&reply, recv_buf, sizeof(reply));
+        if (reply.type != ICMP_ECHOREPLY || reply.code != 0 ||
+            ntohs(reply.un.echo.id) != id || ntohs(reply.un.echo.sequence) != sequence)
             continue;
 
         // RTT
@@ -196,24 +188,7 @@ static PingProbeResult ping_once_linux(const std::string& ip,
                            t_recv - t_send)
                            .count();
 
-        // Extract TTL
-        int ttl = -1;
-        for (cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-             cmsg;
-             cmsg = CMSG_NXTHDR(&msg, cmsg))
-        {
-            if (cmsg->cmsg_level == IPPROTO_IP &&
-                cmsg->cmsg_type == IP_TTL)
-            {
-                std::memcpy(&ttl, CMSG_DATA(cmsg), sizeof(ttl));
-                break;
-            }
-        }
-        // NOTE: Linux ICMP datagram sockets subtract 1 from TTL before exposing it
-        // through IP_RECVTTL. We compensate to match the real hop count.
-        ttl++;
-
-        probe.ttl = (ttl >= 0 ? ttl : -1);
+        probe.ttl = observed_ping_ttl(msg);
         probe.success = true;
 
         ::close(s);
@@ -240,17 +215,21 @@ PingResult ping_host(const std::string& ip, int timeout_ms) {
 
 PingResult ping_host(const std::string& ip, const PingOptions& opt) {
     PingResult result{};
-    bool any_ok = false;
-
     const int attempts = std::max(1, opt.retries);
 
-    for (int i = 0; i < attempts; ++i) {
-        auto probe = ping_once_linux(ip,
-                                     opt.timeout_ms,
-                                     opt.if_name,
-                                     opt.payload_size,
-                                     opt.ttl);
+    sockaddr_in target{};
+    target.sin_family = AF_INET;
+    if (inet_pton(AF_INET, ip.c_str(), &target.sin_addr) != 1) {
+        PingProbeResult probe{};
+        probe.if_name = opt.if_name;
+        probe.error_msg = "Invalid IP address";
+        result.probes.assign(static_cast<std::size_t>(attempts), probe);
+        return result;
+    }
 
+    bool any_ok = false;
+    for (int i = 0; i < attempts; ++i) {
+        auto probe = detail::ping_once_linux(target, opt);
         result.probes.push_back(probe);
 
         if (probe.success) {

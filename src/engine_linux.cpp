@@ -13,7 +13,7 @@
 
 #include "cping/engine.hpp"
 #include "cping/util.hpp"
-#include "cping/ip.hpp"
+#include "linux_ping_socket.hpp"
 
 #include <cstring>
 #include <atomic>
@@ -39,6 +39,7 @@ namespace cping {
 // Global engine state (mirrors Windows implementation)
 // ============================================================================
 static int g_sock = -1;
+static uint16_t g_socket_id = 0;
 static std::thread g_listener;
 static std::atomic<bool> g_running{false};
 
@@ -100,20 +101,20 @@ static void listener_loop() {
     if (s < 0) return;
 
     uint8_t recv_buf[2048];
-    char cbuf[256];
+    alignas(cmsghdr) char cbuf[256];
 
     iovec iov{ recv_buf, sizeof(recv_buf) };
     sockaddr_in src{};
 
     msghdr msg{};
     msg.msg_name = &src;
-    msg.msg_namelen = sizeof(src);
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf;
-    msg.msg_controllen = sizeof(cbuf);
 
     while (g_running.load()) {
+        msg.msg_namelen = sizeof(src);
+        msg.msg_controllen = sizeof(cbuf);
         ssize_t n = ::recvmsg(s, &msg, 0);
 
         if (n < 0) {
@@ -127,30 +128,16 @@ static void listener_loop() {
         if (n < (ssize_t)sizeof(icmphdr))
             continue;
 
-        auto* ricmp = reinterpret_cast<const icmphdr*>(recv_buf);
-        if (ricmp->type != ICMP_ECHOREPLY)
+        icmphdr reply{};
+        std::memcpy(&reply, recv_buf, sizeof(reply));
+        if (reply.type != ICMP_ECHOREPLY || reply.code != 0)
             continue;
 
-        Key k{ ntohs(ricmp->un.echo.id),
-               ntohs(ricmp->un.echo.sequence) };
-
-        // Extract TTL from ancillary data
-        int ttl_val = -1;
-        for (cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-             cmsg;
-             cmsg = CMSG_NXTHDR(&msg, cmsg))
-        {
-            if (cmsg->cmsg_level == IPPROTO_IP &&
-                cmsg->cmsg_type == IP_TTL)
-            {
-                std::memcpy(&ttl_val, CMSG_DATA(cmsg), sizeof(ttl_val));
-                break;
-            }
-        }
+        const Key k{ ntohs(reply.un.echo.id), ntohs(reply.un.echo.sequence) };
 
         PingProbeResult probe{};
         probe.success = true;
-        probe.ttl     = (ttl_val >= 0) ? ttl_val : -1;
+        probe.ttl     = detail::observed_ping_ttl(msg);
         probe.rtt_ms  = 0;  // caller computes RTT
 
         // Resolve waiter, if present
@@ -164,9 +151,6 @@ static void listener_loop() {
             }
         }
 
-        // Reset control buffer
-        msg.msg_control = cbuf;
-        msg.msg_controllen = sizeof(cbuf);
     }
 }
 
@@ -189,6 +173,12 @@ bool init_engine(const std::string& if_name) {
                      if_name.c_str(), (socklen_t)if_name.size());
     }
 
+    const uint16_t id = detail::bind_ping_socket_id(s);
+    if (id == 0) {
+        ::close(s);
+        return false;
+    }
+
     // Enable TTL extraction via recvmsg()
     int one = 1;
     ::setsockopt(s, IPPROTO_IP, IP_RECVTTL, &one, sizeof(one));
@@ -198,6 +188,7 @@ bool init_engine(const std::string& if_name) {
     ::setsockopt(s, IPPROTO_IP, IP_TTL, &ttl_def, sizeof(ttl_def));
 
     g_sock = s;
+    g_socket_id = id;
     g_running = true;
 
     try {
@@ -206,6 +197,7 @@ bool init_engine(const std::string& if_name) {
         g_running = false;
         ::close(g_sock);
         g_sock = -1;
+        g_socket_id = 0;
         return false;
     }
 
@@ -227,6 +219,7 @@ void shutdown_engine() {
     if (g_sock >= 0) {
         ::close(g_sock);
         g_sock = -1;
+        g_socket_id = 0;
     }
 
     // Resolve pending waiters
@@ -251,138 +244,20 @@ PingProbeResult ping_once_engine(const std::string& ip,
     PingProbeResult probe{};
 
     // Parse IPv4
-    in_addr dst{};
-    if (inet_pton(AF_INET, ip.c_str(), &dst) != 1) {
+    sockaddr_in target{};
+    target.sin_family = AF_INET;
+    if (inet_pton(AF_INET, ip.c_str(), &target.sin_addr) != 1) {
         probe.error_msg = "Invalid IP";
         return probe;
     }
 
-    // Fast-path self-ping
-    if (is_local_ipv4_addr_linux(dst)) {
-        // (Kept exactly as your implementation — it's perfect)
-        // Just wrapped commentary removed here for brevity.
-        // -----------------------------------------------------
-        // This block sends a one-shot ping via a temporary socket,
-        // extracts TTL via cmsg, and computes RTT manually.
-        // -----------------------------------------------------
-        // [CODE UNCHANGED — identical to your version]
-        // -----------------------------------------------------
-        // (Te lo lascio invariato per coerenza e performance)
-        // -----------------------------------------------------
-
-        int s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
-        if (s < 0) { probe.error_msg = "socket() failed"; return probe; }
-
-        int one = 1;
-        ::setsockopt(s, IPPROTO_IP, IP_RECVTTL, &one, sizeof(one));
-        if (ttl > 0) ::setsockopt(s, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
-
-        // Timeout
-        timeval tv{};
-        tv.tv_sec  = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-        sockaddr_in dstsa{};
-        dstsa.sin_family = AF_INET;
-        dstsa.sin_addr   = dst;
-
-        if (::connect(s, reinterpret_cast<sockaddr*>(&dstsa), sizeof(dstsa)) < 0) {
-            ::close(s);
-            probe.error_msg = "connect() failed";
-            return probe;
-        }
-
-        uint16_t id  = static_cast<uint16_t>(::getpid() & 0xFFFF);
-        uint16_t seq = g_seq.fetch_add(1, std::memory_order_relaxed);
-
-        std::vector<unsigned char> packet(sizeof(icmphdr) + sizeof(uint64_t) + payload_size, 0);
-        auto* hdr = reinterpret_cast<icmphdr*>(packet.data());
-        hdr->type = ICMP_ECHO;
-        hdr->code = 0;
-        hdr->un.echo.id = htons(id);
-        hdr->un.echo.sequence = htons(seq);
-
-        uint64_t ticks =
-            (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch())
-                .count();
-
-        std::memcpy(packet.data() + sizeof(icmphdr), &ticks, sizeof(ticks));
-
-        hdr->checksum = 0;
-        hdr->checksum = checksum16(packet.data(), packet.size());
-
-        auto t_send = std::chrono::high_resolution_clock::now();
-
-        if (::send(s, packet.data(), packet.size(), 0) < 0) {
-            ::close(s);
-            probe.error_msg = "send() failed";
-            return probe;
-        }
-
-        uint8_t recv_buf[1500];
-        char cbuf[256];
-
-        iovec iov{ recv_buf, sizeof(recv_buf) };
-        msghdr msg{};
-        sockaddr_in src{};
-
-        msg.msg_name = &src;
-        msg.msg_namelen = sizeof(src);
-        msg.msg_iov = &iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cbuf;
-        msg.msg_controllen = sizeof(cbuf);
-
-        while (true) {
-            ssize_t n = ::recvmsg(s, &msg, 0);
-
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                    probe.error_msg = "Timeout";
-                else
-                    probe.error_msg = "recvmsg() failed";
-                break;
-            }
-
-            if (n < (ssize_t)sizeof(icmphdr))
-                continue;
-
-            auto* ricmp = reinterpret_cast<const icmphdr*>(recv_buf);
-            if (ricmp->type != ICMP_ECHOREPLY)
-                continue;
-
-            if (ntohs(ricmp->un.echo.id) != id ||
-                ntohs(ricmp->un.echo.sequence) != seq)
-                continue;
-
-            auto t_recv = std::chrono::high_resolution_clock::now();
-            probe.rtt_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
-                               t_recv - t_send)
-                               .count();
-
-            // Extract TTL
-            int ttl_val = -1;
-            for (cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-                 cmsg;
-                 cmsg = CMSG_NXTHDR(&msg, cmsg))
-            {
-                if (cmsg->cmsg_level == IPPROTO_IP &&
-                    cmsg->cmsg_type == IP_TTL)
-                {
-                    std::memcpy(&ttl_val, CMSG_DATA(cmsg), sizeof(ttl_val));
-                    break;
-                }
-            }
-
-            probe.ttl = (ttl_val >= 0) ? ttl_val : -1;
-            probe.success = true;
-            break;
-        }
-
-        ::close(s);
-        return probe;
+    // A local target can use a connected, temporary ping socket.
+    if (is_local_ipv4_addr_linux(target.sin_addr)) {
+        PingOptions options{};
+        options.timeout_ms = timeout_ms;
+        options.payload_size = payload_size;
+        options.ttl = ttl;
+        return detail::ping_once_linux(target, options);
     }
 
     // Engine path
@@ -391,7 +266,7 @@ PingProbeResult ping_once_engine(const std::string& ip,
         return probe;
     }
 
-    uint16_t id  = static_cast<uint16_t>(::getpid() & 0xFFFF);
+    uint16_t id  = g_socket_id;
     uint16_t seq = g_seq.fetch_add(1, std::memory_order_relaxed);
     Key k{ id, seq };
 
@@ -400,7 +275,10 @@ PingProbeResult ping_once_engine(const std::string& ip,
 
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        g_waiters.emplace(k, std::move(pr));
+        if (!g_waiters.emplace(k, std::move(pr)).second) {
+            probe.error_msg = "ICMP sequence already in use";
+            return probe;
+        }
     }
 
     // Build ICMP Echo Request
@@ -427,10 +305,6 @@ PingProbeResult ping_once_engine(const std::string& ip,
         ::setsockopt(g_sock, IPPROTO_IP, IP_TTL, &ttl, sizeof(ttl));
     }
 
-    sockaddr_in dstsa{};
-    dstsa.sin_family = AF_INET;
-    dstsa.sin_addr   = dst;
-
     auto t_send = std::chrono::high_resolution_clock::now();
 
     ssize_t sent =
@@ -438,8 +312,8 @@ PingProbeResult ping_once_engine(const std::string& ip,
                  packet.data(),
                  packet.size(),
                  0,
-                 reinterpret_cast<sockaddr*>(&dstsa),
-                 sizeof(dstsa));
+                 reinterpret_cast<const sockaddr*>(&target),
+                 sizeof(target));
 
     if (sent < 0) {
         std::lock_guard<std::mutex> lk(g_mtx);
