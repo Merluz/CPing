@@ -20,6 +20,7 @@
 #include <windows.h>
 
 #include "win_icmp.hpp"
+#include "win_route.hpp"
 #include "cping/icmp.hpp"
 #include "cping/util.hpp"
 
@@ -79,6 +80,8 @@ bool set_request_ttl(SOCKET socket, int ttl, int default_ttl) noexcept {
  * @param payload Optional payload pointer
  * @param len     Payload length in bytes
  * @param ttl     Outgoing TTL, -1 or 0 for the system default
+ * @param interface_index IPv4 egress index, or zero for automatic routing
+ * @param error   Optional diagnostic on failure
  *
  * @return true if the request was sent with the requested options.
  */
@@ -87,7 +90,9 @@ bool send_icmp_echo_raw(const in_addr& dst,
                         uint16_t seq,
                         const void* payload,
                         size_t len,
-                        int ttl)
+                        int ttl,
+                        ULONG interface_index,
+                        std::string& error)
 {
     if (!ensure_wsa())
         return false;
@@ -97,6 +102,12 @@ bool send_icmp_echo_raw(const in_addr& dst,
         return false;
 
     if (!set_request_ttl(s, ttl)) {
+        closesocket(s);
+        error = "Could not set outgoing TTL";
+        return false;
+    }
+
+    if (interface_index != 0 && !set_win_ipv4_egress_interface(s, interface_index, error)) {
         closesocket(s);
         return false;
     }
@@ -132,7 +143,11 @@ bool send_icmp_echo_raw(const in_addr& dst,
         sizeof(dstsa)
     );
 
+    const int send_error = sent == SOCKET_ERROR ? WSAGetLastError() : 0;
     closesocket(s);
+    if (sent == SOCKET_ERROR && interface_index != 0) {
+        error = "Send failed on selected interface (Winsock error " + std::to_string(send_error) + ")";
+    }
     return sent != SOCKET_ERROR;
 }
 

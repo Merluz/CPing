@@ -8,7 +8,9 @@ namespace cping {
  * Initializes the global ICMP engine.
  * Opens WinPcap capture + raw ICMP socket + listener thread.
  *
- * @param if_name Optional interface substring; empty = auto-select.
+ * @param if_name Exact Linux interface, Windows adapter name or unique match.
+ * An empty request uses automatic selection or keeps a running session.
+ * An explicit request conflicting with the running session returns false.
  */
 bool init_engine(const std::string& if_name = "");
 

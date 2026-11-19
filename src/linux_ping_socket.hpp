@@ -6,9 +6,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <net/if.h>
 #include <sys/socket.h>
 
 namespace cping::detail {
+
+CPING_LOCAL inline bool bind_ping_interface(int socket, const std::string& name) noexcept {
+    if (name.empty())
+        return true;
+    if (name.size() >= IFNAMSIZ || name.find('\0') != std::string::npos)
+        return false;
+
+    return ::setsockopt(socket, SOL_SOCKET, SO_BINDTODEVICE, name.c_str(),
+                        static_cast<socklen_t>(name.size() + 1)) == 0;
+}
 
 // A Linux ping socket uses its local port as the echo identifier.
 CPING_LOCAL inline std::uint16_t bind_ping_socket_id(int socket) noexcept {

@@ -57,13 +57,12 @@ static PingProbeResult ping_once_win(const std::string& ip,
                                      int payload_size,
                                      int ttl_opt)
 {
-    // Engine override: when DLL engine is active, skip raw pcap path
-    if (engine_available()) {
+    // A per-probe interface request has its own capture and egress socket.
+    if (if_name_override.empty() && engine_available()) {
         return ping_once_engine(ip, timeout_ms, payload_size, ttl_opt);
     }
 
     PingProbeResult probe{};
-    probe.if_name = if_name_override;
 
     // -----------------------------------------------------------------------
     // Validate target IP
@@ -83,6 +82,11 @@ static PingProbeResult ping_once_win(const std::string& ip,
     // Local-host fast path (pure local-loop ICMP)
     // -----------------------------------------------------------------------
     if (is_local_ipv4_addr(dst_addr)) {
+        if (!if_name_override.empty()) {
+            probe.error_msg = "Explicit interface selection is unavailable for native Windows local probes";
+            return probe;
+        }
+
         long rtt_ms = 0;
         int ttl = -1;
 
@@ -111,20 +115,21 @@ static PingProbeResult ping_once_win(const std::string& ip,
         return probe;
     }
 
-    // Manual interface override takes priority
+    // A requested adapter must resolve both the capture device and IPv4 egress.
     pcap_if_t* dev = nullptr;
+    ULONG interface_index = 0;
 
     if (!if_name_override.empty()) {
-        for (pcap_if_t* d = alldevs; d; d = d->next) {
-            if (d->name && std::string(d->name).find(if_name_override) != std::string::npos) {
-                dev = d;
-                break;
-            }
+        WinPingInterface selected;
+        if (!resolve_win_ping_interface(alldevs, if_name_override, selected, probe.error_msg)) {
+            pcap_freealldevs(alldevs);
+            return probe;
         }
+        dev = selected.device;
+        interface_index = selected.index;
+    } else {
+        dev = pick_device_for_target(alldevs, dst_addr);
     }
-
-    // Otherwise auto-pick device for the target
-    if (!dev) dev = pick_device_for_target(alldevs, dst_addr);
 
     if (!dev) {
         pcap_freealldevs(alldevs);
@@ -165,11 +170,13 @@ static PingProbeResult ping_once_win(const std::string& ip,
 
     auto t_send = std::chrono::high_resolution_clock::now();
 
-    if (!send_icmp_echo_raw(dst_addr, id, seqNow, payload.data(), payload.size(), ttl_opt)) {
+    if (!send_icmp_echo_raw(dst_addr, id, seqNow, payload.data(), payload.size(), ttl_opt,
+                            interface_index, probe.error_msg)) {
         pcap_freealldevs(alldevs);
-        probe.error_msg = "send_icmp_echo_raw failed";
+        if (probe.error_msg.empty()) probe.error_msg = "send_icmp_echo_raw failed";
         return probe;
     }
+    if (interface_index != 0) probe.if_name = dev->name;
 
     // -----------------------------------------------------------------------
     // Wait for reply until timeout

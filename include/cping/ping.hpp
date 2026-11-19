@@ -36,7 +36,7 @@ struct PingResult {
 struct PingOptions {
     int timeout_ms{1000};                 // Timeout per probe (ms)
     int retries{1};                       // Number of sequential attempts
-    std::string if_name;                  // Interface name/substring filter
+    std::string if_name;                  // Exact Linux interface or Windows adapter selector
     bool stop_on_first_success{true};     // Early exit on first valid reply
     int payload_size{0};                  // Extra payload bytes after timestamp
     int ttl{-1};                          // Custom TTL, -1 = system default

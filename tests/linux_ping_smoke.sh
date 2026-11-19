@@ -43,4 +43,22 @@ ip netns exec "$peer_ns" sysctl -q -w "net.ipv4.ip_default_ttl=$peer_ttl"
 
 ip netns exec "$sender_ns" timeout 15s "$test_binary" smoke "$peer_ip" "$local_ttl" "$peer_ttl"
 ip netns exec "$peer_ns" python3 "$test_directory/linux_ping_ttl_capture.py" \
-    cping-rx "$sender_ip" "$peer_ip" "$sender_ns" "$test_binary" "$local_ttl" "$peer_ttl"
+    ttl cping-rx "$sender_ip" "$peer_ip" "$sender_ns" "$test_binary" "$local_ttl" "$peer_ttl"
+
+alternate_sender_ip=198.51.100.1
+alternate_peer_ip=198.51.100.2
+ip -n "$sender_ns" link add cping-tx-alt type veth peer name cping-rx-alt
+ip -n "$sender_ns" link set cping-rx-alt netns "$peer_ns"
+ip -n "$sender_ns" addr add "$alternate_sender_ip/30" dev cping-tx-alt
+ip -n "$sender_ns" link set cping-tx-alt up
+ip -n "$peer_ns" addr add "$alternate_peer_ip/30" dev cping-rx-alt
+ip -n "$peer_ns" link set cping-rx-alt up
+ip -n "$sender_ns" route add "$peer_ip/32" dev cping-tx src "$sender_ip" metric 10
+ip -n "$sender_ns" route add "$peer_ip/32" via "$alternate_peer_ip" dev cping-tx-alt \
+    src "$alternate_sender_ip" metric 20
+
+# The test deliberately receives replies on a path different from the preferred route.
+ip netns exec "$sender_ns" sysctl -q -w net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.cping-tx-alt.rp_filter=0
+ip netns exec "$peer_ns" python3 "$test_directory/linux_ping_ttl_capture.py" \
+    interface cping-rx "$sender_ip" "$peer_ip" "$sender_ns" "$test_binary" "$local_ttl" "$peer_ttl" \
+    cping-rx-alt "$alternate_sender_ip" cping-tx-alt
