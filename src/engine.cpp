@@ -1,384 +1,351 @@
-/**
- * High-performance ICMP engine (Windows).
- *
- * Responsibilities:
- * - Open a raw ICMP socket + WinPcap capture
- * - Spawn a listener thread that dispatches ICMP Echo Replies to waiting probes
- * - Correlate replies using (id, seq) pairs stored in a promise/future map
- * - Provide a fast async probe API (ping_once_engine)
- *
- * This engine is optional: the higher-level ping implementation will fall
- * back to raw-socket + pcap (ping_once_win) when the engine is disabled.
- */
-
 #include "cping/engine.hpp"
-#include "win/win_pcap.hpp"
-#include "win/win_icmp.hpp"
-#include "win/win_route.hpp"
 #include "cping/util.hpp"
+#include "win/win_engine_session.hpp"
+#include "win/win_icmp.hpp"
+#include "win/win_pcap.hpp"
+#include "win/win_route.hpp"
 
 #include <cstring>
-#include <atomic>
 #include <future>
-#include <mutex>
-#include <thread>
 #include <unordered_map>
+#include <utility>
+#include <windows.h>
 
 namespace cping {
+namespace {
 
-// ============================================================================
-// Global engine state
-// ============================================================================
-static Capture g_cap;
-static SOCKET g_sock = INVALID_SOCKET;
+using win_engine::CaptureResult;
+using win_engine::Clock;
+using win_engine::Reply;
+using win_engine::Transport;
 
-static std::thread g_listener;
-static std::atomic<bool> g_running{false};
-
-// Key used to correlate echo replies with outstanding promises
-struct Key { uint16_t id; uint16_t seq; };
-
-struct KeyHash {
-    size_t operator()(const Key& k) const noexcept {
-        return (size_t(k.id) << 16) ^ k.seq;
-    }
-};
-struct KeyEq {
-    bool operator()(const Key& a, const Key& b) const noexcept {
-        return a.id == b.id && a.seq == b.seq;
-    }
-};
-
-// Map (id,seq) → promise<Probe>
-static std::unordered_map<
-    Key,
-    std::promise<PingProbeResult>,
-    KeyHash,
-    KeyEq
-> g_waiters;
-
-static std::mutex g_mtx;
-
-// Global sequence generator (per process)
-static std::atomic<uint16_t> g_seq{1};
-
-
-// ============================================================================
-// Listener thread
-// ============================================================================
-/**
- * Captures inbound ICMP Echo Replies via WinPcap and dispatches them
- * to the corresponding waiting promise, if present.
- *
- * RTT is calculated by the caller (which knows the send timestamp).
- * Here we only capture TTL and confirm that the reply matches id/seq.
- */
-static void listener_loop() {
-    constexpr int ETHER_LEN = 14;
-
-    pcap_t* cap = g_cap.h;
-    if (!cap) return;
-
-    while (g_running.load()) {
-        pcap_pkthdr* h = nullptr;
-        const u_char* data = nullptr;
-
-        int r = pcap_next_ex(cap, &h, &data);
-        if (r == 0)   continue; // timeout
-        if (r == -2) break;     // breakloop()
-        if (r == -1) break;     // error
-
-        if (!h || h->caplen < ETHER_LEN + sizeof(IpHeader))
-            continue;
-
-        auto* iphdr = reinterpret_cast<const IpHeader*>(data + ETHER_LEN);
-        if ((iphdr->ver_ihl >> 4) != 4) continue;  // must be IPv4
-        if (iphdr->protocol != 1)        continue;  // ICMP only
-
-        uint8_t ihl = (iphdr->ver_ihl & 0x0F) * 4;
-        if (h->caplen < ETHER_LEN + ihl + sizeof(IcmpHeader))
-            continue;
-
-        auto* icmph = reinterpret_cast<const IcmpHeader*>(data + ETHER_LEN + ihl);
-        if (icmph->type != 0) continue;  // 0 = Echo Reply
-
-        Key k{ ntohs(icmph->id), ntohs(icmph->seq) };
-
-        PingProbeResult probe{};
-        probe.success = true;
-        probe.ttl     = static_cast<int>(iphdr->ttl);
-        probe.rtt_ms  = 0; // caller computes actual RTT
-
-        // Try to resolve promise
-        {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            auto it = g_waiters.find(k);
-            if (it != g_waiters.end()) {
-                std::promise<PingProbeResult> tmp = std::move(it->second);
-                g_waiters.erase(it);
-                try { tmp.set_value(probe); } catch (...) {}
-            }
-        }
-    }
-}
-
-
-// ============================================================================
-// Engine lifecycle
-// ============================================================================
-/**
- * Initializes the global ICMP engine.
- *
- * 1) Select capture device (manual override or auto by ROUTE)
- * 2) Open WinPcap capture in immediate mode
- * 3) Open raw ICMP socket
- * 4) Start listener thread
- */
-bool init_engine(const std::string& if_name) {
-    if (g_running.load())
-        return true; // already initialized
-
-    char errbuf[PCAP_ERRBUF_SIZE]{};
-    pcap_if_t* alldevs = nullptr;
-
-    if (pcap_findalldevs(&alldevs, errbuf) == -1 || !alldevs)
-        return false;
-
-    pcap_if_t* dev = nullptr;
-
-    // Case 1: manual selection by substring
-    if (!if_name.empty()) {
-        for (pcap_if_t* d = alldevs; d; d = d->next) {
-            if (d->name && std::string(d->name).find(if_name) != std::string::npos) {
-                dev = d;
-                break;
-            }
-        }
-    }
-
-    // Case 2: auto-select based on best route to 8.8.8.8
-    if (!dev) {
-        in_addr gateway{};
-        gateway.S_un.S_addr = inet_addr("8.8.8.8");
-        dev = pick_device_for_target(alldevs, gateway);
-    }
-
-    if (!dev) {
-        pcap_freealldevs(alldevs);
-        return false;
-    }
-
-    // Configure capture
-    if (!open_capture(g_cap, dev->name, 1, errbuf)) {
-        pcap_freealldevs(alldevs);
-        return false;
-    }
-    if (!apply_icmp_filter(g_cap, "")) {
-        pcap_freealldevs(alldevs);
-        return false;
-    }
-
-    pcap_freealldevs(alldevs);
-
-    // Prepare raw ICMP socket
-    if (!ensure_wsa())
-        return false;
-
-    g_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    if (g_sock == INVALID_SOCKET)
-        return false;
-
-    g_running = true;
-    g_listener = std::thread(listener_loop);
-
-    return true;
-}
-
-
-/**
- * Shuts down the global engine (listener, pcap, socket, pending waiters).
- */
-void shutdown_engine() {
-    g_running = false;
-
-    // Signal capture loop to stop
-    if (g_cap.h)
-        pcap_breakloop(g_cap.h);
-
-    // Join listener
-    if (g_listener.joinable()) {
-        try { g_listener.join(); } catch (...) {}
-    }
-
-    // Close capture
-    if (g_cap.h) {
-        pcap_close(g_cap.h);
-        g_cap.h = nullptr;
-    }
-
-    // Close socket
-    if (g_sock != INVALID_SOCKET) {
-        closesocket(g_sock);
-        g_sock = INVALID_SOCKET;
-    }
-
-    // Resolve all outstanding promises with empty result
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        for (auto& kv : g_waiters) {
-            try {
-                auto fut = kv.second.get_future();
-                if (fut.valid())
-                    kv.second.set_value(PingProbeResult{});
-            } catch (...) {}
-        }
-        g_waiters.clear();
-    }
-}
-
-
-// ============================================================================
-// Engine probe
-// ============================================================================
-/**
- * Performs a single ICMP probe using the global engine.
- *
- * Workflow:
- * - Create (id,seq) pair
- * - Insert promise into waiter map
- * - Send raw ICMP Echo Request
- * - Wait for listener thread to resolve the future
- */
-PingProbeResult ping_once_engine(const std::string& ip,
-                                 int timeout_ms,
-                                 int payload_size,
-                                 int ttl)
-{
+PingProbeResult failed_probe(const char* reason) {
     PingProbeResult probe{};
-
-    // Validate IPv4
-    in_addr dst{};
-    if (InetPtonA(AF_INET, ip.c_str(), &dst) != 1) {
-        probe.error_msg = "Invalid IP";
-        return probe;
-    }
-
-    // Fast-path for local addresses
-    if (is_local_ipv4_addr(dst)) {
-        long rtt_ms = 0;
-        int ttl_local = -1;
-
-        if (icmp_ping_local(dst, timeout_ms, rtt_ms, ttl_local)) {
-            probe.success = true;
-            probe.rtt_ms  = rtt_ms;
-            probe.ttl     = ttl_local;
-        } else {
-            probe.error_msg = "Local ICMP failed";
-        }
-
-        return probe;
-    }
-
-    if (g_sock == INVALID_SOCKET) {
-        probe.error_msg = "Engine socket not available";
-        return probe;
-    }
-
-    // Allocate id/seq and waiter entry
-    uint16_t id  = static_cast<uint16_t>(GetCurrentProcessId() & 0xFFFF);
-    uint16_t seq = g_seq.fetch_add(1, std::memory_order_relaxed);
-
-    Key k{ id, seq };
-
-    std::promise<PingProbeResult> pr;
-    auto fut = pr.get_future();
-
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_waiters.emplace(k, std::move(pr));
-    }
-
-    // Craft payload (timestamp + extra bytes)
-    uint64_t ticks = GetTickCount64();
-    std::vector<unsigned char> payload(sizeof(ticks) + payload_size, 0);
-    std::memcpy(payload.data(), &ticks, sizeof(ticks));
-
-    // Build ICMP Echo Request
-    IcmpHeader req{};
-    req.type = 8;
-    req.code = 0;
-    req.id   = htons(id);
-    req.seq  = htons(seq);
-
-    std::vector<unsigned char> packet(sizeof(IcmpHeader) + payload.size());
-    std::memcpy(packet.data(), &req, sizeof(req));
-    std::memcpy(packet.data() + sizeof(req), payload.data(), payload.size());
-
-    reinterpret_cast<IcmpHeader*>(packet.data())->checksum =
-        checksum16(packet.data(), packet.size());
-
-    sockaddr_in dstsa{};
-    dstsa.sin_family = AF_INET;
-    dstsa.sin_addr   = dst;
-
-    // Optional TTL override
-    if (ttl > 0) {
-        setsockopt(
-            g_sock,
-            IPPROTO_IP,
-            IP_TTL,
-            reinterpret_cast<const char*>(&ttl),
-            sizeof(ttl)
-        );
-    }
-
-    // Send
-    auto t_send = std::chrono::high_resolution_clock::now();
-
-    int sent = sendto(
-        g_sock,
-        reinterpret_cast<const char*>(packet.data()),
-        static_cast<int>(packet.size()),
-        0,
-        reinterpret_cast<const sockaddr*>(&dstsa),
-        sizeof(dstsa)
-    );
-
-    if (sent == SOCKET_ERROR) {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_waiters.erase(k);
-        probe.error_msg = "sendto failed";
-        return probe;
-    }
-
-    // Wait for reply
-    if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready) {
-        probe = fut.get();
-
-        auto t_recv = std::chrono::high_resolution_clock::now();
-        probe.rtt_ms = static_cast<long>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(t_recv - t_send).count()
-        );
-
-        return probe;
-    }
-
-    // Timeout: remove waiter
-    {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_waiters.erase(k);
-    }
-
-    probe.error_msg = "Timeout";
+    probe.error_msg = reason;
     return probe;
 }
 
+class WindowsTransport final : public Transport {
+public:
+    ~WindowsTransport() override {
+        if (socket_ != INVALID_SOCKET) closesocket(socket_);
+        if (stop_event_) CloseHandle(stop_event_);
+    }
 
-// ============================================================================
-// Status API
-// ============================================================================
+    bool open(const std::string& if_name) {
+        char errbuf[PCAP_ERRBUF_SIZE]{};
+        pcap_if_t* device_list = nullptr;
+        const int listed = pcap_findalldevs(&device_list, errbuf);
+        const std::unique_ptr<pcap_if_t, decltype(&pcap_freealldevs)>
+            devices(device_list, pcap_freealldevs);
+        if (listed == -1 || !devices) return false;
+
+        pcap_if_t* device = nullptr;
+        if (!if_name.empty()) {
+            for (auto* entry = devices.get(); entry; entry = entry->next) {
+                if (entry->name && std::string(entry->name).find(if_name) != std::string::npos) {
+                    device = entry;
+                    break;
+                }
+            }
+        }
+        if (!device) {
+            in_addr route_target{};
+            route_target.S_un.S_addr = inet_addr("8.8.8.8");
+            device = pick_device_for_target(devices.get(), route_target);
+        }
+        if (!device || !open_capture(capture_, device->name, 1, errbuf) ||
+            !apply_icmp_filter(capture_, "")) {
+            return false;
+        }
+
+        // Nonblocking reads drain packets already buffered by Npcap. The listener
+        // then waits for either fresh capture data or our own shutdown event.
+        if (pcap_setnonblock(capture_.h, 1, errbuf) != 0 ||
+            pcap_setmintocopy(capture_.h, 0) != 0) {
+            return false;
+        }
+        capture_event_ = pcap_getevent(capture_.h);
+        if (!capture_event_ || capture_event_ == INVALID_HANDLE_VALUE) return false;
+
+        stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!stop_event_ || !ensure_wsa()) return false;
+
+        socket_ = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        return socket_ != INVALID_SOCKET;
+    }
+
+    CaptureResult receive(Reply& reply) noexcept override {
+        if (WaitForSingleObject(stop_event_, 0) != WAIT_TIMEOUT) return CaptureResult::Failed;
+
+        pcap_pkthdr* header = nullptr;
+        const u_char* data = nullptr;
+        const int status = pcap_next_ex(capture_.h, &header, &data);
+        if (status < 0) return CaptureResult::Failed;
+        if (status == 0) {
+            const HANDLE events[]{stop_event_, capture_event_};
+            return WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0 + 1
+                ? CaptureResult::Idle : CaptureResult::Failed;
+        }
+
+        constexpr int ethernet_size = 14;
+        if (!header || header->caplen < ethernet_size + sizeof(IpHeader)) {
+            return CaptureResult::Idle;
+        }
+
+        const auto* ip = reinterpret_cast<const IpHeader*>(data + ethernet_size);
+        if ((ip->ver_ihl >> 4) != 4 || ip->protocol != IPPROTO_ICMP) return CaptureResult::Idle;
+
+        const int ip_size = (ip->ver_ihl & 0x0F) * 4;
+        if (header->caplen < ethernet_size + ip_size + sizeof(IcmpHeader)) {
+            return CaptureResult::Idle;
+        }
+
+        const auto* icmp = reinterpret_cast<const IcmpHeader*>(data + ethernet_size + ip_size);
+        if (icmp->type != 0) return CaptureResult::Idle;
+
+        reply = {ntohs(icmp->id), ntohs(icmp->seq), ip->ttl};
+        return CaptureResult::Reply;
+    }
+
+    bool send(std::span<const unsigned char> packet, std::uint32_t destination,
+              int ttl, Clock::time_point& sent_at) noexcept override {
+        sockaddr_in target{};
+        target.sin_family = AF_INET;
+        target.sin_addr.S_un.S_addr = destination;
+
+        if (ttl > 0) {
+            setsockopt(socket_, IPPROTO_IP, IP_TTL, reinterpret_cast<const char*>(&ttl), sizeof(ttl));
+        }
+
+        sent_at = Clock::now();
+        return sendto(socket_, reinterpret_cast<const char*>(packet.data()),
+                      static_cast<int>(packet.size()), 0,
+                      reinterpret_cast<const sockaddr*>(&target), sizeof(target)) != SOCKET_ERROR;
+    }
+
+    void wake() noexcept override {
+        SetEvent(stop_event_);
+    }
+
+private:
+    Capture capture_;
+    SOCKET socket_ = INVALID_SOCKET;
+    HANDLE capture_event_ = nullptr; // Owned by the pcap handle.
+    HANDLE stop_event_ = nullptr;
+};
+
+win_engine::Engine& native_engine() {
+    // DLL clients stop the engine before unloading. Joining a listener during
+    // static destruction can run under the Windows DLL loader lock.
+    static auto* const engine = new win_engine::Engine;
+    return *engine;
+}
+
+} // namespace
+
+namespace win_engine {
+
+class Engine::Session {
+public:
+    explicit Session(std::unique_ptr<Transport> transport) : transport_(std::move(transport)) {}
+
+    ~Session() {
+        if (listener_.joinable()) stop();
+    }
+
+    bool start(const StartListener& launch) {
+        auto listen = [this] { listen_loop(); };
+        listener_ = launch ? launch(listen) : std::thread(listen);
+        return listener_.joinable() && available();
+    }
+
+    void stop() {
+        {
+            std::lock_guard lock(mutex_);
+            running_ = false;
+            fail_pending("Engine stopped");
+        }
+        transport_->wake();
+        listener_.join();
+        transport_.reset();
+    }
+
+    bool available() const {
+        std::lock_guard lock(mutex_);
+        return running_;
+    }
+
+    PingProbeResult probe(std::uint16_t sequence, std::uint32_t destination,
+                          int timeout_ms, int payload_size, int ttl) {
+        if (payload_size < 0) return failed_probe("Invalid payload size");
+
+        IcmpHeader request{};
+        request.type = 8;
+        request.id = htons(id_);
+        request.seq = htons(sequence);
+
+        const std::uint64_t ticks = GetTickCount64();
+        std::vector<unsigned char> packet(sizeof(request) + sizeof(ticks) + payload_size, 0);
+        std::memcpy(packet.data(), &request, sizeof(request));
+        std::memcpy(packet.data() + sizeof(request), &ticks, sizeof(ticks));
+        reinterpret_cast<IcmpHeader*>(packet.data())->checksum = checksum16(packet.data(), packet.size());
+
+        auto completion = std::make_shared<std::promise<PingProbeResult>>();
+        auto reply = completion->get_future();
+        Clock::time_point sent_at;
+
+        {
+            std::lock_guard lock(mutex_);
+            if (!running_) return failed_probe("Engine socket not available");
+            if (!pending_.emplace(sequence, completion).second) {
+                return failed_probe("ICMP sequence already in use");
+            }
+
+            // Stop waits for any in-progress send, but never for its reply.
+            if (!transport_->send(packet, destination, ttl, sent_at)) {
+                pending_.erase(sequence);
+                return failed_probe("sendto failed");
+            }
+        }
+
+        if (reply.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
+            std::lock_guard lock(mutex_);
+            const auto entry = pending_.find(sequence);
+            if (entry != pending_.end() && entry->second == completion) {
+                pending_.erase(entry);
+                return failed_probe("Timeout");
+            }
+            // The listener or shutdown has already completed this waiter.
+        }
+
+        auto result = reply.get();
+        if (result.success) {
+            result.rtt_ms = static_cast<long>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - sent_at).count());
+        }
+        return result;
+    }
+
+private:
+    void fail_pending(const char* reason) {
+        for (auto& [sequence, completion] : pending_) {
+            completion->set_value(failed_probe(reason));
+        }
+        pending_.clear();
+    }
+
+    void listen_loop() {
+        for (;;) {
+            Reply reply{};
+            const auto status = transport_->receive(reply);
+
+            std::lock_guard lock(mutex_);
+            if (!running_) return;
+            if (status == CaptureResult::Failed) {
+                running_ = false;
+                fail_pending("Engine capture failed");
+                return;
+            }
+
+            if (status != CaptureResult::Reply || reply.id != id_) continue;
+
+            const auto entry = pending_.find(reply.sequence);
+            if (entry == pending_.end()) continue;
+
+            PingProbeResult result{};
+            result.success = true;
+            result.ttl = reply.ttl;
+            entry->second->set_value(std::move(result));
+            pending_.erase(entry);
+        }
+    }
+
+    std::unique_ptr<Transport> transport_;
+    std::thread listener_;
+    mutable std::mutex mutex_;
+    const std::uint16_t id_ = static_cast<std::uint16_t>(GetCurrentProcessId() & 0xFFFF);
+    bool running_ = true;
+    std::unordered_map<std::uint16_t, std::shared_ptr<std::promise<PingProbeResult>>> pending_;
+};
+
+Engine::~Engine() {
+    stop();
+}
+
+bool Engine::start(const OpenTransport& open, const StartListener& launch) {
+    std::lock_guard lock(lifecycle_mutex_);
+    if (const auto previous = session_.load()) {
+        if (previous->available()) return true;
+        previous->stop();
+        session_.store(nullptr);
+    }
+
+    try {
+        auto transport = open();
+        if (!transport) return false;
+
+        auto session = std::make_shared<Session>(std::move(transport));
+        if (!session->start(launch)) return false;
+
+        session_.store(std::move(session));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void Engine::stop() {
+    std::lock_guard lock(lifecycle_mutex_);
+    if (const auto session = session_.load()) {
+        session->stop();
+        session_.store(nullptr);
+    }
+}
+
+bool Engine::available() const {
+    const auto session = session_.load();
+    return session && session->available();
+}
+
+PingProbeResult Engine::probe(std::uint32_t destination, int timeout_ms, int payload_size, int ttl) {
+    const auto session = session_.load();
+    if (!session) return failed_probe("Engine socket not available");
+
+    const auto sequence = sequence_.fetch_add(1, std::memory_order_relaxed);
+    return session->probe(sequence, destination, timeout_ms, payload_size, ttl);
+}
+
+} // namespace win_engine
+
+bool init_engine(const std::string& if_name) {
+    return native_engine().start([&if_name]() -> std::unique_ptr<Transport> {
+        auto transport = std::make_unique<WindowsTransport>();
+        if (!transport->open(if_name)) return nullptr;
+        return transport;
+    });
+}
+
+void shutdown_engine() {
+    native_engine().stop();
+}
+
+PingProbeResult ping_once_engine(const std::string& ip, int timeout_ms, int payload_size, int ttl) {
+    in_addr destination{};
+    if (InetPtonA(AF_INET, ip.c_str(), &destination) != 1) return failed_probe("Invalid IP");
+
+    if (is_local_ipv4_addr(destination)) {
+        PingProbeResult probe{};
+        probe.success = icmp_ping_local(destination, timeout_ms, probe.rtt_ms, probe.ttl);
+        if (!probe.success) probe.error_msg = "Local ICMP failed";
+        return probe;
+    }
+
+    return native_engine().probe(destination.S_un.S_addr, timeout_ms, payload_size, ttl);
+}
+
 bool engine_available() {
-    return g_running.load();
+    return native_engine().available();
 }
 
 } // namespace cping

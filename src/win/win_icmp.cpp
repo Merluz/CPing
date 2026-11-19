@@ -16,6 +16,7 @@
 #include <icmpapi.h>
 #include <vector>
 #include <cstring>
+#include <mutex>
 #include <windows.h>
 
 #include "win_icmp.hpp"
@@ -34,13 +35,17 @@
  * @return true if Winsock is ready.
  */
 bool ensure_wsa() {
-    static bool inited = false;
-    if (!inited) {
-        WSADATA wsa{};
-        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
-            return false;
-        inited = true;
-    }
+    static std::mutex startup_mutex;
+    static bool initialized = false;
+    std::lock_guard lock(startup_mutex);
+    if (initialized)
+        return true;
+
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        return false;
+
+    initialized = true;
     return true;
 }
 
